@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elevator Control System</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .elevator-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 20px;
+        }
+
+        .elevator-panel {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .elevator-status {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .status-connected { background-color: #4CAF50; }
+        .status-disconnected { background-color: #f44336; }
+        .status-moving { background-color: #ff9800; }
+        .status-idle { background-color: #2196F3; }
+
+        .floor-buttons {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .floor-btn {
+            padding: 15px;
+            border: none;
+            border-radius: 8px;
+            background: #f0f0f0;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+
+        .floor-btn:hover {
+            background: #e0e0e0;
+            transform: translateY(-2px);
+        }
+
+        .floor-btn.active {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .door-controls {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .door-btn {
+            flex: 1;
+            padding: 15px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+
+        .door-btn.open {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .door-btn.close {
+            background: #f44336;
+            color: white;
+        }
+
+        .door-btn:hover {
+            opacity: 0.8;
+            transform: translateY(-2px);
+        }
+
+        .relay-status {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .relay-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 5px;
+            border-left: 4px solid #ddd;
+        }
+
+        .relay-item.active {
+            border-left-color: #4CAF50;
+            background: #e8f5e8;
+        }
+
+        .coordinates-panel {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+
+        .coordinate-input {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin: 10px 0;
+        }
+
+        .coordinate-input input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .workflow-controls {
+            margin: 20px 0;
+        }
+
+        .workflow-btn {
+            width: 100%;
+            padding: 12px;
+            margin: 5px 0;
+            border: none;
+            border-radius: 6px;
+            background: #2196F3;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        .workflow-btn:hover {
+            background: #1976D2;
+        }
+
+        .workflow-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .log-panel {
+            background: #1e1e1e;
+            color: #00ff00;
+            border-radius: 8px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+
+        .log-entry {
+            margin: 2px 0;
+            padding: 2px 0;
+        }
+
+        .log-entry.error {
+            color: #ff4444;
+        }
+
+        .log-entry.success {
+            color: #44ff44;
+        }
+
+        .log-entry.info {
+            color: #4444ff;
+        }
+    </style>
+</head>
+<body>
+    <div class="admin-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>Elevator Control</h2>
+            </div>
+            <ul class="nav-links">
+                <li>
+                    <a href="admin.html">
+                        <i class="icon">📊</i>
+                        Dashboard
+                    </a>
+                </li>
+                <li class="active">
+                    <a href="elevator-control.html">
+                        <i class="icon">🏢</i>
+                        Elevator Control
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-control.html">
+                        <i class="icon">🤖</i>
+                        Robot Control
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-monitoring.html">
+                        <i class="icon">📡</i>
+                        Robot Monitoring
+                    </a>
+                </li>
+            </ul>
+            <div class="sidebar-footer">
+                <button id="logoutBtn" class="btn btn-danger">Logout</button>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="content-header">
+                <h1>Elevator Control System</h1>
+                <div class="user-info">
+                    <span id="username">Admin</span>
+                </div>
+            </header>
+
+            <div class="elevator-container">
+                <!-- Left Panel: Control Interface -->
+                <div class="elevator-panel">
+                    <h2>Elevator Control</h2>
+                    
+                    <!-- Status Display -->
+                    <div class="elevator-status">
+                        <h3>System Status</h3>
+                        <p>
+                            <span id="connectionStatus" class="status-indicator status-disconnected"></span>
+                            <span id="connectionText">Disconnected</span>
+                        </p>
+                        <p>Current Floor: <span id="currentFloor">-</span></p>
+                        <p>Target Floor: <span id="targetFloor">-</span></p>
+                        <p>Status: <span id="elevatorStatus">Unknown</span></p>
+                    </div>
+
+                    <!-- Floor Selection -->
+                    <h3>Floor Selection</h3>
+                    <div class="floor-buttons">
+                        <button class="floor-btn" data-floor="1">Floor 1</button>
+                        <button class="floor-btn" data-floor="2">Floor 2</button>
+                        <button class="floor-btn" data-floor="3">Floor 3</button>
+                        <button class="floor-btn" data-floor="4">Floor 4</button>
+                    </div>
+
+                    <!-- Door Controls -->
+                    <h3>Door Controls</h3>
+                    <div class="door-controls">
+                        <button id="openDoorBtn" class="door-btn open">Open Door</button>
+                        <button id="closeDoorBtn" class="door-btn close">Close Door</button>
+                    </div>
+
+                    <!-- Relay Status -->
+                    <h3>Relay Status</h3>
+                    <div class="relay-status" id="relayStatus">
+                        <!-- Relay status will be populated by JavaScript -->
+                    </div>
+
+                    <!-- Connection Controls -->
+                    <h3>Connection</h3>
+                    <div class="door-controls">
+                        <button id="connectBtn" class="door-btn open">Connect</button>
+                        <button id="disconnectBtn" class="door-btn close">Disconnect</button>
+                    </div>
+                </div>
+
+                <!-- Right Panel: Advanced Controls -->
+                <div class="elevator-panel">
+                    <h2>Advanced Controls</h2>
+
+                    <!-- Floor Coordinates -->
+                    <h3>Floor Coordinates</h3>
+                    <div class="coordinates-panel">
+                        <label>Floor:</label>
+                        <select id="floorSelect">
+                            <option value="1">Floor 1</option>
+                            <option value="2">Floor 2</option>
+                            <option value="3">Floor 3</option>
+                            <option value="4">Floor 4</option>
+                        </select>
+                        
+                        <div class="coordinate-input">
+                            <input type="number" id="approachX" placeholder="Approach X" step="0.1">
+                            <input type="number" id="approachY" placeholder="Approach Y" step="0.1">
+                        </div>
+                        <div class="coordinate-input">
+                            <input type="number" id="entranceX" placeholder="Entrance X" step="0.1">
+                            <input type="number" id="entranceY" placeholder="Entrance Y" step="0.1">
+                        </div>
+                        <div class="coordinate-input">
+                            <input type="number" id="exitX" placeholder="Exit X" step="0.1">
+                            <input type="number" id="exitY" placeholder="Exit Y" step="0.1">
+                        </div>
+                        
+                        <button id="saveCoordsBtn" class="workflow-btn">Save Coordinates</button>
+                        <button id="loadCoordsBtn" class="workflow-btn">Load Coordinates</button>
+                    </div>
+
+                    <!-- Workflow Controls -->
+                    <h3>Workflow Controls</h3>
+                    <div class="workflow-controls">
+                        <button id="testMovementBtn" class="workflow-btn">Test Movement (1→2→1)</button>
+                        <button id="maintenanceBtn" class="workflow-btn">Run Maintenance Test</button>
+                        <button id="emergencyStopBtn" class="workflow-btn" style="background: #f44336;">Emergency Stop</button>
+                    </div>
+
+                    <!-- System Log -->
+                    <h3>System Log</h3>
+                    <div class="log-panel" id="logPanel">
+                        <div class="log-entry info">Elevator Control System initialized...</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="elevator-control.js"></script>
+</body>
+</html> 

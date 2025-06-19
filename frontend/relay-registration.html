@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relay Registration System</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .relay-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 20px;
+        }
+
+        .relay-panel {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .relay-form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .form-group label {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .form-group textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .capabilities-group {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        .capability-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .capability-checkbox input[type="checkbox"] {
+            width: auto;
+        }
+
+        .btn-primary {
+            background: #2196F3;
+            color: white;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        .btn-primary:hover {
+            background: #1976D2;
+        }
+
+        .btn-danger {
+            background: #f44336;
+            color: white;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        .btn-danger:hover {
+            background: #d32f2f;
+        }
+
+        .relay-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .relay-item {
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .relay-item:hover {
+            background: #e9ecef;
+            transform: translateY(-2px);
+        }
+
+        .relay-item.selected {
+            border-color: #2196F3;
+            background: #e3f2fd;
+        }
+
+        .relay-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .relay-name {
+            font-weight: bold;
+            font-size: 16px;
+        }
+
+        .relay-status {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .status-online { background: #4CAF50; color: white; }
+        .status-offline { background: #f44336; color: white; }
+        .status-error { background: #ff9800; color: white; }
+
+        .relay-details {
+            font-size: 14px;
+            color: #666;
+        }
+
+        .relay-associations {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .association-tag {
+            display: inline-block;
+            background: #e0e0e0;
+            padding: 2px 6px;
+            border-radius: 10px;
+            margin: 2px;
+        }
+
+        .association-tag.robot { background: #bbdefb; }
+        .association-tag.template { background: #c8e6c9; }
+
+        .association-panel {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+
+        .association-controls {
+            display: flex;
+            gap: 10px;
+            margin: 10px 0;
+        }
+
+        .association-controls select {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .association-controls button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .btn-associate {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .btn-associate:hover {
+            background: #45a049;
+        }
+
+        .btn-disassociate {
+            background: #f44336;
+            color: white;
+        }
+
+        .btn-disassociate:hover {
+            background: #d32f2f;
+        }
+
+        .stats-panel {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="admin-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>Relay Management</h2>
+            </div>
+            <ul class="nav-links">
+                <li>
+                    <a href="admin.html">
+                        <i class="icon">📊</i>
+                        Dashboard
+                    </a>
+                </li>
+                <li>
+                    <a href="elevator-control.html">
+                        <i class="icon">🏢</i>
+                        Elevator Control
+                    </a>
+                </li>
+                <li class="active">
+                    <a href="relay-registration.html">
+                        <i class="icon">🔌</i>
+                        Relay Registration
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-control.html">
+                        <i class="icon">🤖</i>
+                        Robot Control
+                    </a>
+                </li>
+            </ul>
+            <div class="sidebar-footer">
+                <button id="logoutBtn" class="btn btn-danger">Logout</button>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="content-header">
+                <h1>Relay Registration System</h1>
+                <div class="user-info">
+                    <span id="username">Admin</span>
+                </div>
+            </header>
+
+            <!-- Statistics Panel -->
+            <div class="stats-panel">
+                <h3>System Statistics</h3>
+                <div class="stats-grid" id="statsGrid">
+                    <div class="stat-item">
+                        <div class="stat-number" id="totalRelays">0</div>
+                        <div class="stat-label">Total Relays</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="onlineRelays">0</div>
+                        <div class="stat-label">Online</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="offlineRelays">0</div>
+                        <div class="stat-label">Offline</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="errorRelays">0</div>
+                        <div class="stat-label">Error</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="relay-container">
+                <!-- Left Panel: Relay Registration -->
+                <div class="relay-panel">
+                    <h2>Register New Relay</h2>
+                    
+                    <form class="relay-form" id="relayForm">
+                        <div class="form-group">
+                            <label for="relayId">Relay ID *</label>
+                            <input type="text" id="relayId" required placeholder="e.g., elevator-001">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="relayName">Name *</label>
+                            <input type="text" id="relayName" required placeholder="e.g., Main Building Elevator">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="relayType">Type *</label>
+                            <select id="relayType" required>
+                                <option value="">Select Type</option>
+                                <option value="elevator">Elevator</option>
+                                <option value="door">Door</option>
+                                <option value="light">Light</option>
+                                <option value="gate">Gate</option>
+                                <option value="custom">Custom</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="relayIp">IP Address *</label>
+                            <input type="text" id="relayIp" required placeholder="e.g., 192.168.1.100">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="relayPort">Port</label>
+                            <input type="number" id="relayPort" value="81" min="1" max="65535">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="relayDescription">Description</label>
+                            <textarea id="relayDescription" placeholder="Describe the relay's purpose and location"></textarea>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Capabilities</label>
+                            <div class="capabilities-group">
+                                <div class="capability-checkbox">
+                                    <input type="checkbox" id="cap_door_control" value="door_control">
+                                    <label for="cap_door_control">Door Control</label>
+                                </div>
+                                <div class="capability-checkbox">
+                                    <input type="checkbox" id="cap_floor_selection" value="floor_selection">
+                                    <label for="cap_floor_selection">Floor Selection</label>
+                                </div>
+                                <div class="capability-checkbox">
+                                    <input type="checkbox" id="cap_light_control" value="light_control">
+                                    <label for="cap_light_control">Light Control</label>
+                                </div>
+                                <div class="capability-checkbox">
+                                    <input type="checkbox" id="cap_gate_control" value="gate_control">
+                                    <label for="cap_gate_control">Gate Control</label>
+                                </div>
+                                <div class="capability-checkbox">
+                                    <input type="checkbox" id="cap_status_monitoring" value="status_monitoring">
+                                    <label for="cap_status_monitoring">Status Monitoring</label>
+                                </div>
+                                <div class="capability-checkbox">
+                                    <input type="checkbox" id="cap_emergency_stop" value="emergency_stop">
+                                    <label for="cap_emergency_stop">Emergency Stop</label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="btn-primary">Register Relay</button>
+                    </form>
+                </div>
+
+                <!-- Right Panel: Relay Management -->
+                <div class="relay-panel">
+                    <h2>Relay Management</h2>
+                    
+                    <!-- Association Panel -->
+                    <div class="association-panel">
+                        <h3>Associations</h3>
+                        <div class="association-controls">
+                            <select id="robotSelect">
+                                <option value="">Select Robot</option>
+                            </select>
+                            <select id="templateSelect">
+                                <option value="">Select Template</option>
+                            </select>
+                            <button id="associateBtn" class="btn-associate">Associate</button>
+                            <button id="disassociateBtn" class="btn-disassociate">Disassociate</button>
+                        </div>
+                    </div>
+
+                    <!-- Relay List -->
+                    <h3>Registered Relays</h3>
+                    <div class="relay-list" id="relayList">
+                        <!-- Relay items will be populated by JavaScript -->
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="relay-registration.js"></script>
+</body>
+</html> 
