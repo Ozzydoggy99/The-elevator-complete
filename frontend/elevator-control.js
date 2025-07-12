@@ -375,3 +375,4 @@ document.addEventListener('DOMContentLoaded', () => {
     // Make it globally accessible for debugging
     window.elevatorControl = elevatorControl;
 }); 
+ 

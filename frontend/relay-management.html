@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relay Management - Skytech Automated</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .relay-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .relay-card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-left: 4px solid #007bff;
+        }
+        
+        .relay-card.online {
+            border-left-color: #28a745;
+        }
+        
+        .relay-card.offline {
+            border-left-color: #dc3545;
+        }
+        
+        .relay-card.error {
+            border-left-color: #ffc107;
+        }
+        
+        .relay-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .relay-name {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .relay-status {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        
+        .status-online {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status-offline {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .status-error {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .relay-info {
+            margin-bottom: 15px;
+        }
+        
+        .relay-info p {
+            margin: 5px 0;
+            color: #666;
+        }
+        
+        .relay-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        
+        .modal-content {
+            background-color: white;
+            margin: 5% auto;
+            padding: 20px;
+            border-radius: 10px;
+            width: 80%;
+            max-width: 500px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .stat-number {
+            font-size: 2em;
+            font-weight: bold;
+            color: #007bff;
+        }
+        
+        .stat-label {
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔌 Relay Management</h1>
+            <nav>
+                <a href="index.html">Home</a>
+                <a href="admin.html">Admin</a>
+                <a href="relay-management.html" class="active">Relay Management</a>
+                <button onclick="logout()" class="btn-logout">Logout</button>
+            </nav>
+        </header>
+
+        <main>
+            <!-- Statistics -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number" id="total-relays">0</div>
+                    <div class="stat-label">Total Relays</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="online-relays">0</div>
+                    <div class="stat-label">Online</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="assigned-relays">0</div>
+                    <div class="stat-label">Assigned to Templates</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="unassigned-relays">0</div>
+                    <div class="stat-label">Unassigned</div>
+                </div>
+            </div>
+
+            <!-- Actions -->
+            <div class="actions">
+                <button onclick="showAddRelayModal()" class="btn btn-primary">➕ Add Relay</button>
+                <button onclick="refreshRelays()" class="btn btn-secondary">🔄 Refresh</button>
+                <button onclick="showBulkAssignModal()" class="btn btn-success">📋 Bulk Assign</button>
+            </div>
+
+            <!-- Filters -->
+            <div class="filters">
+                <select id="status-filter" onchange="filterRelays()">
+                    <option value="">All Status</option>
+                    <option value="online">Online</option>
+                    <option value="offline">Offline</option>
+                    <option value="error">Error</option>
+                </select>
+                <select id="template-filter" onchange="filterRelays()">
+                    <option value="">All Templates</option>
+                </select>
+                <input type="text" id="search-filter" placeholder="Search relays..." onkeyup="filterRelays()">
+            </div>
+
+            <!-- Relay Grid -->
+            <div class="relay-grid" id="relay-grid">
+                <!-- Relays will be populated here -->
+            </div>
+        </main>
+    </div>
+
+    <!-- Add/Edit Relay Modal -->
+    <div id="relayModal" class="modal">
+        <div class="modal-content">
+            <h2 id="modal-title">Add New Relay</h2>
+            <form id="relayForm">
+                <div class="form-group">
+                    <label for="mac-address">MAC Address:</label>
+                    <input type="text" id="mac-address" name="mac_address" placeholder="XX:XX:XX:XX:XX:XX" required>
+                </div>
+                <div class="form-group">
+                    <label for="relay-name">Name:</label>
+                    <input type="text" id="relay-name" name="name" placeholder="Relay Name" required>
+                </div>
+                <div class="form-group">
+                    <label for="relay-location">Location:</label>
+                    <input type="text" id="relay-location" name="location" placeholder="Building, Floor, Room">
+                </div>
+                <div class="form-group">
+                    <label for="relay-description">Description:</label>
+                    <textarea id="relay-description" name="description" placeholder="Additional details"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="relay-template">Assign to Template:</label>
+                    <select id="relay-template" name="template_id">
+                        <option value="">No Template</option>
+                    </select>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="button" onclick="closeModal()" class="btn btn-secondary">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Bulk Assign Modal -->
+    <div id="bulkAssignModal" class="modal">
+        <div class="modal-content">
+            <h2>Bulk Assign Relays</h2>
+            <form id="bulkAssignForm">
+                <div class="form-group">
+                    <label for="bulk-template">Select Template:</label>
+                    <select id="bulk-template" name="template_id" required>
+                        <option value="">Choose Template</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Select Relays to Assign:</label>
+                    <div id="bulk-relay-list">
+                        <!-- Relay checkboxes will be populated here -->
+                    </div>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Assign Selected</button>
+                    <button type="button" onclick="closeBulkModal()" class="btn btn-secondary">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="relay-management.js"></script>
+</body>
+</html> 
+ 
+ 
+ 

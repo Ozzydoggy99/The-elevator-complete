@@ -5,17 +5,31 @@ const path = require('path');
 const WorkflowManager = require('./core/WorkflowManager');
 const RobotManager = require('./core/RobotManager');
 const MapManager = require('./core/MapManager');
+const RelayManager = require('./core/RelayManager');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const robotMaps = require('./robot-maps.js');
 const db = require('../db');
 const JWT_SECRET = 'your-secret-key';
 const cron = require('node-cron');
+const { determineWorkflowType } = require('./core/multifloor-workflows');
+const { SerialPort } = require('serialport');
 
 // Initialize Express app
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+
+// Create a second server instance for elevator relays on port 80
+const relayServer = http.createServer();
+const relayWss = new WebSocket.Server({ 
+    server: relayServer,
+    path: '/elevator'
+});
+
+// Store connected relays, keyed by their MAC address
+// Each entry contains: { ws: WebSocket, ip: string }
+const connectedRelays = new Map();
 
 // Ensure JSON and CORS middleware are set before any routes
 app.use(express.json());
@@ -25,6 +39,54 @@ app.use(cors());
 const workflowManager = new WorkflowManager();
 const robotManager = new RobotManager();
 const mapManager = new MapManager();
+const relayManager = new RelayManager();
+
+// Initialize database tables
+async function initializeDatabase() {
+    try {
+        // Create relay_configurations table if it doesn't exist (don't drop existing data)
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS relay_configurations (
+                id SERIAL PRIMARY KEY,
+                relay_id VARCHAR(255) UNIQUE NOT NULL,
+                relay_name VARCHAR(255) NOT NULL,
+                ssid VARCHAR(255) NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                ip_address VARCHAR(15),
+                port INTEGER DEFAULT 81,
+                channel_config JSONB NOT NULL DEFAULT '{}',
+                capabilities TEXT[] DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        
+        // Add missing columns to templates table if they don't exist
+
+        await db.query(`ALTER TABLE templates ADD COLUMN IF NOT EXISTS multifloor BOOLEAN DEFAULT FALSE;`);
+        
+        // Add ip_address column to relays table if it doesn't exist
+        await db.query(`ALTER TABLE relays ADD COLUMN IF NOT EXISTS ip_address VARCHAR(15);`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_relays_ip_address ON relays(ip_address);`);
+        
+        console.log('Database tables initialized successfully');
+    } catch (err) {
+        console.error('Error initializing database tables:', err);
+    }
+}
+
+// Initialize database on startup
+initializeDatabase();
+
+// Initialize managers
+(async () => {
+    try {
+        await relayManager.initialize();
+        console.log('RelayManager initialized successfully');
+    } catch (err) {
+        console.error('Error initializing RelayManager:', err);
+    }
+})();
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
@@ -56,7 +118,7 @@ app.get('/api/templates', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/templates', authenticateToken, async (req, res) => {
-    const { name, color, robotId, bossUser, stationary } = req.body;
+            const { name, color, robotId, bossUser, multifloor } = req.body;
 
     if (!name || !color || !robotId || !bossUser || !bossUser.username || !bossUser.password) {
         return res.status(400).json({ error: 'All fields are required' });
@@ -72,7 +134,7 @@ app.post('/api/templates', authenticateToken, async (req, res) => {
 
         // Insert the template
         const insertSql = `
-            INSERT INTO templates (name, color, robot, boss_user, stationary)
+            INSERT INTO templates (name, color, robot, boss_user, multifloor)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING *
         `;
@@ -81,7 +143,7 @@ app.post('/api/templates', authenticateToken, async (req, res) => {
         color,
             JSON.stringify(robot),
             JSON.stringify(bossUser),
-            stationary || false
+            multifloor || false
         ]);
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -92,12 +154,12 @@ app.post('/api/templates', authenticateToken, async (req, res) => {
 
 app.put('/api/templates/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { name, color, stationary } = req.body;
+    const { name, color, multifloor } = req.body;
 
     try {
         const result = await db.query(
-            'UPDATE templates SET name = $1, color = $2, stationary = $3 WHERE id = $4 RETURNING *',
-            [name, color, stationary || false, id]
+            'UPDATE templates SET name = $1, color = $2, multifloor = $3 WHERE id = $4 RETURNING *',
+            [name, color, multifloor || false, id]
         );
 
         if (result.rows.length === 0) {
@@ -317,30 +379,8 @@ const checkAuth = (req, res, next) => {
     }
 };
 
-// Robot configuration
-const robotConfig = {
-    id: 'L382502104987ir',
-    ip: '47.180.91.99',
-    port: 8090,
-    secret: '667a51a4d948433081a272c78d10a8a4',
-    name: 'Public Robot',
-    type: 'standard'
-};
-
-// Register the robot
-try {
-    const robotId = robotManager.addRobot(robotConfig);
-    console.log(`Robot registered with ID: ${robotId}`);
-    
-    // Connect to the robot
-    robotManager.connectRobot(robotId).then(() => {
-        console.log('Successfully connected to robot');
-    }).catch(error => {
-        console.error('Failed to connect to robot:', error);
-    });
-} catch (error) {
-    console.error('Failed to register robot:', error);
-}
+// The system will automatically connect to robots from the database
+// No hardcoded robot configuration needed
 
 // Serve static files
 app.use(express.static(path.join(__dirname, '../frontend')));
@@ -643,23 +683,326 @@ app.post('/api/robot-maps', async (req, res) => {
 });
 
 // WebSocket connection handling
-wss.on('connection', (ws) => {
-    console.log('New client connected');
+wss.on('connection', async (ws, req) => {
+    // Extract MAC address from the connection URL to identify relays
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const macAddress = url.searchParams.get('id');
 
-    // Handle messages from clients
+    if (macAddress) {
+        // --- This is a Relay Connection ---
+        // Extract IP address from the connection
+        const relayIP = req.socket.remoteAddress || req.connection.remoteAddress || 'unknown';
+        
+        // Check if the received ID is a valid MAC address format
+        const isValidMacAddress = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/.test(macAddress);
+        console.log('[DEBUG] Relay WebSocket connection: macAddress =', macAddress, 'relayIP =', relayIP, 'isValidMacAddress =', isValidMacAddress);
+        
+        if (!isValidMacAddress) {
+            console.log(`[DEBUG] ⚠️  Received non-MAC address ID: ${macAddress}. Will extract MAC from device registration.`);
+        }
+        
+        console.log(`[DEBUG] Relay connected with ID: ${macAddress} from IP: ${relayIP}`);
+        
+        // Store both WebSocket and IP address
+        connectedRelays.set(macAddress, {
+            ws: ws,
+            ip: relayIP,
+            actualMacAddress: null // Will be set when device registers
+        });
+
+        // Insert or update connected_relays table
+        try {
+            console.log('[DEBUG] Attempting to insert/update connected_relays for', macAddress, relayIP);
+            const result = await db.query(`
+                INSERT INTO connected_relays (mac_address, status, is_connected, last_seen, ip_address)
+                VALUES ($1, 'online', TRUE, CURRENT_TIMESTAMP, $2)
+                ON CONFLICT (mac_address) DO UPDATE
+                SET status = 'online', is_connected = TRUE, last_seen = CURRENT_TIMESTAMP, ip_address = $2
+                `, [macAddress, relayIP]);
+            console.log('[DEBUG] Insert/update for connected_relays completed for', macAddress, 'Result:', result.rowCount);
+        } catch (err) {
+            console.error('[DEBUG] Error inserting/updating connected_relays for', macAddress, err);
+        }
+
+        ws.on('message', async (message) => {
+            try {
+                const data = JSON.parse(message);
+                console.log(`Received message from relay ${macAddress}:`, data);
+
+                // Handle device registration (accept both old and new formats)
+                if (data.type === 'device_register' || data.type === 'register') {
+                    console.log(`Relay ${macAddress} registering as ${data.device_name}`);
+                    console.log(`🔍 Full device registration data:`, JSON.stringify(data, null, 2));
+                    
+                    // Extract MAC address from registration message (new format uses 'mac', old format uses 'mac_address')
+                    const actualMac = data.mac || data.mac_address;
+                    const deviceIP = data.ip;
+                    
+                    if (actualMac) {
+                        const relayData = connectedRelays.get(macAddress);
+                        if (relayData) {
+                            relayData.actualMacAddress = actualMac;
+                            console.log(`✅ Updated actual MAC address: ${actualMac}`);
+                        }
+                    } else {
+                        console.log(`⚠️  No mac field in device registration`);
+                        // Generate a proper MAC address from the device_id if it's not a MAC
+                        const isValidMac = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/.test(macAddress);
+                        if (!isValidMac) {
+                            // Generate a MAC address based on the device_id
+                            const hash = require('crypto').createHash('md5').update(macAddress).digest('hex');
+                            const generatedMac = `${hash.substring(0,2)}:${hash.substring(2,4)}:${hash.substring(4,6)}:${hash.substring(6,8)}:${hash.substring(8,10)}:${hash.substring(10,12)}`;
+                            const relayData = connectedRelays.get(macAddress);
+                            if (relayData) {
+                                relayData.actualMacAddress = generatedMac;
+                                console.log(`🔧 Generated MAC address: ${generatedMac} from device_id: ${macAddress}`);
+                            }
+                        }
+                    }
+                    
+                    // Update IP address if provided
+                    if (deviceIP) {
+                        const relayData = connectedRelays.get(macAddress);
+                        if (relayData) {
+                            relayData.ip = deviceIP;
+                            console.log(`✅ Updated IP address: ${deviceIP}`);
+                        }
+                        
+                        // Update IP address in database
+                        try {
+                            await db.query(`
+                                UPDATE relays 
+                                SET ip_address = $1, last_seen = CURRENT_TIMESTAMP
+                                WHERE mac_address = $2
+                            `, [deviceIP, macAddress]);
+                            console.log(`✅ Updated relay IP address in database: ${macAddress} -> ${deviceIP}`);
+                            
+                            // Also update RelayManager if relay exists
+                            const relay = relayManager.findRelayByMAC(macAddress);
+                            if (relay) {
+                                await relayManager.updateRelayIP(relay.id, deviceIP);
+                                console.log(`✅ Updated RelayManager IP for relay ${relay.id}: ${deviceIP}`);
+                                
+                                // Try to connect to the relay now that we have its IP
+                                try {
+                                    await relayManager.connectToRelayWhenIPAvailable(relay.id, deviceIP);
+                                    console.log(`✅ Successfully connected to relay ${relay.id} for command sending`);
+                                } catch (err) {
+                                    console.error(`❌ Failed to connect to relay ${relay.id} for command sending:`, err);
+                                }
+                            }
+                        } catch (err) {
+                            console.error(`Error updating relay IP address in database for ${macAddress}:`, err);
+                        }
+                    }
+                }
+                
+                // Handle state updates (accept both old and new formats)
+                if (data.type === 'full_state' || data.type === 'state') {
+                    console.log(`Relay ${macAddress} state:`, {
+                        relays: data.relays,
+                        inputs: data.inputs
+                    });
+                    
+                    // Update IP address if provided in state message
+                    if (data.ip) {
+                        const relayData = connectedRelays.get(macAddress);
+                        if (relayData) {
+                            relayData.ip = data.ip;
+                        }
+                    }
+                }
+                
+                // Look up relay configuration from relay_configurations table based on MAC address
+                try {
+                    const relayResult = await db.query(`
+                        SELECT rc.*, cr.name as relay_name
+                        FROM relay_configurations rc
+                        LEFT JOIN connected_relays cr ON cr.relay_configuration_id = rc.id
+                        WHERE cr.mac_address = $1 OR rc.relay_id = $1
+                    `, [macAddress]);
+                    
+                    if (relayResult.rows.length > 0) {
+                        const relayConfig = relayResult.rows[0];
+                        const channelConfig = relayConfig.channel_config || {};
+                        
+                        // Convert channel_config to the format expected by firmware
+                        const relays = [];
+                        const inputPins = [];
+                        
+                        // Parse channel configuration
+                        for (let i = 0; i < 8; i++) {
+                            const channelKey = `channel${i}`;
+                            const channel = channelConfig[channelKey];
+                            
+                            if (channel) {
+                                relays.push({
+                                    bitPosition: i,
+                                    inputPin: channel.inputPin || -1,
+                                    function: channel.function || `unused_${i}`,
+                                    enabled: channel.enabled !== false,
+                                    safetyRequired: channel.safetyRequired || false
+                                });
+                                inputPins.push(channel.inputPin || -1);
+                            } else {
+                                relays.push({
+                                    bitPosition: i,
+                                    inputPin: -1,
+                                    function: `unused_${i}`,
+                                    enabled: false,
+                                    safetyRequired: false
+                                });
+                                inputPins.push(-1);
+                            }
+                        }
+                        
+                        // Send the relay's configuration from relay_configurations table
+                        const configMessage = {
+                            type: "config",
+                            device_id: relayConfig.relay_id || macAddress,
+                            device_name: relayConfig.relay_name || relayConfig.relay_name || "ESP32 Relay Controller",
+                            num_relays: 8,
+                            num_inputs: 8,
+                            relays: relays,
+                            input_pins: inputPins
+                        };
+                        
+                        ws.send(JSON.stringify(configMessage));
+                        console.log(`Sent relay configuration for ${relayConfig.relay_name || relayConfig.relay_id} to relay ${macAddress}`);
+                    } else {
+                        console.log(`Relay configuration not found for ${macAddress}, skipping config send`);
+                    }
+                } catch (err) {
+                    console.error(`Error looking up relay configuration for ${macAddress}:`, err);
+                }
+            }
+            
+            catch (error) {
+                console.error(`Error parsing message from relay ${macAddress}:`, error);
+            }
+        });
+
+        ws.on('close', async () => {
+            const relayData = connectedRelays.get(macAddress);
+            const relayIP = relayData ? relayData.ip : 'unknown';
+            console.log(`Relay disconnected: ${macAddress} from IP: ${relayIP}`);
+            connectedRelays.delete(macAddress);
+
+            // Update relay status to offline
+            try {
+                await db.query(`
+                    UPDATE relays 
+                    SET status = 'offline'
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`Updated relay status to offline: ${macAddress}`);
+            } catch (err) {
+                console.error(`Error updating relay status for ${macAddress}:`, err);
+            }
+            // Update connected_relays table to mark as offline
+            try {
+                await db.query(`
+                    UPDATE connected_relays
+                    SET status = 'offline', is_connected = FALSE, last_seen = CURRENT_TIMESTAMP
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`Updated connected_relays status to offline: ${macAddress}`);
+            } catch (err) {
+                console.error(`Error updating connected_relays status for ${macAddress}:`, err);
+            }
+        });
+
+        ws.on('error', async (error) => {
+            const relayData = connectedRelays.get(macAddress);
+            const relayIP = relayData ? relayData.ip : 'unknown';
+            console.error(`Error with relay ${macAddress} from IP: ${relayIP}:`, error);
+            connectedRelays.delete(macAddress);
+            
+            // Update relay status to error
+            try {
+                await db.query(`
+                    UPDATE relays 
+                    SET status = 'error'
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`Updated relay status to error: ${macAddress}`);
+            } catch (err) {
+                console.error(`Error updating relay status for ${macAddress}:`, err);
+            }
+            // Update connected_relays table to mark as error
+            try {
+                await db.query(`
+                    UPDATE connected_relays
+                    SET status = 'error', is_connected = FALSE, last_seen = CURRENT_TIMESTAMP
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`Updated connected_relays status to error: ${macAddress}`);
+            } catch (err) {
+                console.error(`Error updating connected_relays status for ${macAddress}:`, err);
+            }
+        });
+
+    } else {
+        // --- This is a Robot or UI Connection (Original Logic) ---
+        console.log('New client connected (robot or UI)');
+
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
-            handleWebSocketMessage(ws, data);
+                handleWebSocketMessage(ws, data); // Using the original handler
         } catch (error) {
             console.error('Error handling message:', error);
             ws.send(JSON.stringify({ type: 'error', message: error.message }));
         }
     });
 
-    // Handle client disconnection
     ws.on('close', () => {
-        console.log('Client disconnected');
+            console.log('Client disconnected (robot or UI)');
+    });
+        
+        ws.on('error', (error) => {
+             console.error('Error with client (robot or UI):', error);
+        });
+    }
+});
+
+// New API endpoint to send commands to a specific relay
+app.post('/api/relays/:mac/command', async (req, res) => {
+    const { mac } = req.params;
+    const { command, type, relay, state } = req.body;
+
+    // Simple relay command - send relay number directly to ESP32
+    const messageToSend = {
+        type: 'relay_control',
+        relay: relay,  // Use relay number directly (0-7)
+        state: state
+    };
+
+    const relayData = connectedRelays.get(mac);
+
+    if (relayData && relayData.ws.readyState === WebSocket.OPEN) {
+        relayData.ws.send(JSON.stringify(messageToSend));
+        res.status(200).json({ message: `Command '${messageToSend.type}' sent to relay ${mac} at IP: ${relayData.ip}` });
+    } else {
+        res.status(404).json({ error: `Relay with MAC address ${mac} not connected or not ready.` });
+    }
+});
+
+// API endpoint to get all connected relays with their IP addresses
+app.get('/api/relays/connected', (req, res) => {
+    const connectedRelaysList = [];
+    
+    for (const [mac, relayData] of connectedRelays.entries()) {
+        connectedRelaysList.push({
+            mac: mac,
+            ip: relayData.ip,
+            status: relayData.ws.readyState === WebSocket.OPEN ? 'connected' : 'disconnected'
+        });
+    }
+    
+    res.json({
+        count: connectedRelaysList.length,
+        relays: connectedRelaysList
     });
 });
 
@@ -690,6 +1033,99 @@ async function handleWebSocketMessage(ws, data) {
         case 'get_map_points':
             const points = mapManager.getMapPoints(data.mapId);
             ws.send(JSON.stringify({ type: 'map_points', points }));
+            break;
+
+        case 'set_relay':
+            // Forward relay command to the appropriate relay
+            const deviceId = data.device_id;
+            const relayName = data.relay;
+            const relayState = data.state;
+            
+            // Improved: Map device_id to relay connection using MAC or device_id
+            let targetRelay = null;
+            let targetMac = null;
+            for (const [mac, relayData] of connectedRelays.entries()) {
+                // Match by device_id or MAC address (case-insensitive)
+                if (
+                  mac.toLowerCase() === deviceId.toLowerCase() ||
+                  (relayData.device_id && relayData.device_id.toLowerCase() === deviceId.toLowerCase())
+                ) {
+                    targetRelay = relayData.ws;
+                    targetMac = mac;
+                    break;
+                }
+            }
+            
+            if (targetRelay && targetRelay.readyState === WebSocket.OPEN) {
+                // Look up relay configuration from database to get proper channel mapping
+                try {
+                    const relayResult = await db.query(`
+                        SELECT rc.*, cr.name as relay_name
+                        FROM relay_configurations rc
+                        LEFT JOIN connected_relays cr ON cr.relay_configuration_id = rc.id
+                        WHERE cr.mac_address = $1
+                    `, [targetMac]);
+                    
+                    let relayCommand;
+                    if (relayResult.rows.length > 0) {
+                        const relayConfig = relayResult.rows[0];
+                        const channelConfig = relayConfig.channel_config || {};
+                        
+                        // Find the relay by function name in the channel configuration
+                        let channelIndex = -1;
+                        for (let i = 0; i < 8; i++) {
+                            const channelKey = `channel${i}`;
+                            const channel = channelConfig[channelKey];
+                            if (channel && channel.function === relayName) {
+                                channelIndex = i;
+                                break;
+                            }
+                        }
+                        
+                        if (channelIndex !== -1) {
+                            relayCommand = {
+                                type: 'relay_control',
+                                relay: channelIndex,
+                                state: relayState
+                            };
+                            console.log(`[RELAY] Forwarded command to ${deviceId}: ${relayName} (channel ${channelIndex}) = ${relayState}`);
+                        } else {
+                            // Fallback to relay name if not found in mapping
+                            relayCommand = {
+                                type: 'relay_control',
+                                relay: relayName,
+                                state: relayState
+                            };
+                            console.log(`[RELAY] Forwarded command to ${deviceId}: ${relayName} (no mapping found) = ${relayState}`);
+                        }
+                    } else {
+                        // Fallback to relay name if relay not found in database
+                        relayCommand = {
+                            type: 'relay_control',
+                            relay: relayName,
+                            state: relayState
+                        };
+                        console.log(`[RELAY] Forwarded command to ${deviceId}: ${relayName} (not in DB) = ${relayState}`);
+                    }
+                    
+                    targetRelay.send(JSON.stringify(relayCommand));
+                    ws.send(JSON.stringify({ type: 'relay_command_sent', relay: relayName, state: relayState }));
+                } catch (err) {
+                    console.error(`Error looking up relay configuration for ${targetMac}:`, err);
+                    // Fallback to relay name if database lookup fails
+                const relayCommand = {
+                        type: 'relay_control',
+                    relay: relayName,
+                    state: relayState
+                };
+                targetRelay.send(JSON.stringify(relayCommand));
+                    console.log(`[RELAY] Forwarded command to ${deviceId}: ${relayName} (DB error) = ${relayState}`);
+                ws.send(JSON.stringify({ type: 'relay_command_sent', relay: relayName, state: relayState }));
+                }
+            } else {
+                console.error(`[RELAY] Relay ${deviceId} not found or not connected`);
+                ws.send(JSON.stringify({ type: 'error', message: `Relay ${deviceId} not found or not connected` }));
+            }
             break;
 
         default:
@@ -840,104 +1276,6 @@ async function sendJack(robot, service) {
     await new Promise(resolve => setTimeout(resolve, 10000));
 }
 
-// Function to clear robot errors (for stationary workflows)
-async function clearRobotErrors(robot) {
-    const robotConfig = new RobotConfig(robot);
-    console.log('=== Clearing Robot Errors ===');
-    console.log('Robot Config:', {
-        serialNumber: robotConfig.serialNumber,
-        publicIp: robotConfig.publicIp,
-        localIp: robotConfig.localIp,
-        secret: robotConfig.secret
-    });
-    
-    try {
-        // Try to clear errors via the robot's error clearing endpoint
-        const response = await fetch(`${robotConfig.getBaseUrl()}/chassis/clear_errors`, {
-            method: 'POST',
-            headers: robotConfig.getHeaders(),
-            body: JSON.stringify({})
-        });
-        
-        if (response.ok) {
-            console.log('✅ Robot errors cleared successfully');
-        } else {
-            console.log('⚠️ Error clearing endpoint not available, continuing...');
-        }
-    } catch (error) {
-        console.log('⚠️ Could not clear robot errors, continuing...', error.message);
-    }
-    
-    // Also try to clear via services endpoint if available
-    try {
-        const response2 = await fetch(`${robotConfig.getBaseUrl()}/services/clear_errors`, {
-            method: 'POST',
-            headers: robotConfig.getHeaders(),
-            body: JSON.stringify({})
-        });
-        
-        if (response2.ok) {
-            console.log('✅ Robot errors cleared via services endpoint');
-        }
-    } catch (error) {
-        console.log('⚠️ Services error clearing not available');
-    }
-}
-
-// Function to try to force move or ignore errors (for stationary workflows)
-async function tryForceMoveOrIgnoreError(robot, moveParams = null) {
-    const robotConfig = new RobotConfig(robot);
-    console.log('=== Attempting to Force Move or Ignore Error ===');
-    console.log('Robot Config:', {
-        serialNumber: robotConfig.serialNumber,
-        publicIp: robotConfig.publicIp,
-        localIp: robotConfig.localIp,
-        secret: robotConfig.secret
-    });
-    
-    const endpoints = [
-        '/chassis/ignore_error',
-        '/chassis/force_move',
-        '/chassis/moves/force',
-        '/services/ignore_error',
-        '/services/force_move',
-        '/chassis/override_safety',
-        '/chassis/disable_shelf_shifting',
-        '/chassis/stationary_mode'
-    ];
-    
-    for (const endpoint of endpoints) {
-        try {
-            console.log(`Trying endpoint: ${endpoint}`);
-            const response = await fetch(`${robotConfig.getBaseUrl()}${endpoint}`, {
-                method: 'POST',
-                headers: robotConfig.getHeaders(),
-                body: JSON.stringify(moveParams || { force: true, ignore_errors: true })
-            });
-            
-            if (response.ok) {
-                const data = await response.json();
-                console.log(`✅ Success with ${endpoint}:`, data);
-                return true;
-            } else {
-                console.log(`❌ Failed with ${endpoint}: ${response.status} ${response.statusText}`);
-            }
-        } catch (error) {
-            console.log(`❌ Error with ${endpoint}:`, error.message);
-        }
-    }
-    
-    // Try to send a modified move command with force flags
-    if (moveParams) {
-        try {
-            console.log('Trying modified move command with force flags');
-            const forceMoveParams = {
-                ...moveParams,
-                force: true,
-                ignore_errors: true,
-                ignore_safety: true,
-                stationary_rack: true
-            };
             
             const response = await fetch(`${robotConfig.getBaseUrl()}/chassis/moves`, {
                 method: 'POST',
@@ -995,7 +1333,7 @@ async function checkMoveStatus(robot, moveId) {
 }
 
 // Update waitForMoveComplete with better status checking
-async function waitForMoveComplete(robot, moveId, timeout = 600000, isStationary = false) {
+async function waitForMoveComplete(robot, moveId, timeout = 600000) {
     const startTime = Date.now();
     let isMoving = true;
 
@@ -1007,16 +1345,6 @@ async function waitForMoveComplete(robot, moveId, timeout = 600000, isStationary
             isMoving = false;
             console.log('✅ Move completed successfully');
         } else if (status === 'failed' || status === 'cancelled') {
-            // For stationary workflows, try to force the move before giving up
-            if (isStationary) {
-                console.log('⚠️ Move failed, attempting to force/ignore error for stationary workflow...');
-                const forceResult = await tryForceMoveOrIgnoreError(robot);
-                if (forceResult) {
-                    console.log('✅ Force move successful, continuing...');
-                    isMoving = false;
-                    return; // Continue as if move succeeded
-                }
-            }
             throw new Error(`Move failed with status: ${status}`);
         } else {
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1335,207 +1663,1066 @@ async function executeWorkflow(robot, type, centralLoad, centralLoadDocking, she
     }
 }
 
-// Stationary workflow execution functions
-async function executeStationaryWorkflow(robot, type, centralLoad, centralLoadDocking, shelfLoad, shelfLoadDocking, charger, options = {}) {
-    if (type === 'stationary_dropoff') {
-        console.log(`[STATIONARY] Starting stationary dropoff workflow for robot ${robot.serialNumber}`);
+
+
+// Shared elevator controller factory function
+async function createElevatorController(elevatorRelays, templateId) {
+    const mainRelay = elevatorRelays[0];
+    
+    return {
+        relays: elevatorRelays,
+        mainRelay: mainRelay,
+        templateId: templateId,
         
-        try {
-            // 1. Move to central_load_docking
-            const move1 = {
-                type: 'standard',
-                target_x: centralLoadDocking.coordinates[0],
-                target_y: centralLoadDocking.coordinates[1],
-                target_z: 0,
-                target_ori: parseFloat(centralLoadDocking.raw_properties.yaw) || 0,
-                creator: 'backend',
-                point_id: centralLoadDocking.id
-            };
-            const move1Id = await sendMoveTask(robot, move1);
-            await waitForMoveComplete(robot, move1Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after move
-
-            // 2. Align at central_load (stationary rack) with extra precision
-            const align1 = {
-                type: 'align_with_rack',
-                target_x: centralLoad.coordinates[0],
-                target_y: centralLoad.coordinates[1],
-                target_z: 0,
-                target_ori: parseFloat(centralLoad.raw_properties.yaw) || 0,
-                target_accuracy: 0.02, // Higher precision for stationary rack
-                creator: 'backend',
-                point_id: centralLoad.id
-            };
-            const align1Id = await sendMoveTask(robot, align1);
-            await waitForMoveComplete(robot, align1Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after alignment
+        // Method to activate hall call (first command when robot arrives at elevator)
+        async activateHallCall() {
+            const hallCallRelay = findRelayForFunction(elevatorRelays, 'hall_call');
+            if (!hallCallRelay) {
+                throw new Error('No hall_call relay found');
+            }
             
-            // Extra wait time for stationary rack alignment
-            await new Promise(resolve => setTimeout(resolve, 3000));
-
-            // 3. Jack up
-            await sendJack(robot, 'jack_up');
-            await clearRobotErrors(robot); // Clear any errors after jack up
-            await new Promise(resolve => setTimeout(resolve, 12000)); // Extra time for stationary rack
-
-            // 4. Move to shelf_load_docking (with bin lifted)
-            const move2 = {
-                type: 'standard',
-                target_x: shelfLoadDocking.coordinates[0],
-                target_y: shelfLoadDocking.coordinates[1],
-                target_z: 0.2,
-                target_ori: parseFloat(shelfLoadDocking.raw_properties.yaw) || 0,
-                creator: 'backend',
-                point_id: shelfLoadDocking.id
-            };
-            const move2Id = await sendMoveTask(robot, move2);
-            await waitForMoveComplete(robot, move2Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after move
-
-            // 5. Move to shelf_load (align with stationary rack)
-            const move3 = {
-                type: 'align_with_rack',
-                target_x: shelfLoad.coordinates[0],
-                target_y: shelfLoad.coordinates[1],
-                target_z: 0.2,
-                target_ori: parseFloat(shelfLoad.raw_properties.yaw) || 0,
-                target_accuracy: 0.02, // Higher precision for stationary rack
-                creator: 'backend',
-                point_id: shelfLoad.id
-            };
-            const move3Id = await sendMoveTask(robot, move3);
-            await waitForMoveComplete(robot, move3Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after alignment
-
-            // 6. Jack down
-            await sendJack(robot, 'jack_down');
-            await clearRobotErrors(robot); // Clear any errors after jack down
-            await new Promise(resolve => setTimeout(resolve, 12000));
-
-            // 7. Return to charger
-            const moveCharger = {
-                type: 'charge',
-                target_x: charger.coordinates[0],
-                target_y: charger.coordinates[1],
-                target_z: 0,
-                target_ori: parseFloat(charger.raw_properties.yaw) || 0,
-                target_accuracy: 0.05,
-                charge_retry_count: 5,
-                creator: 'backend',
-                point_id: charger.id
-            };
-            const moveChargerId = await sendMoveTask(robot, moveCharger);
-            await waitForMoveComplete(robot, moveChargerId, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after final move
+            console.log(`[ELEVATOR] Activating hall call via relay ${hallCallRelay.relay.name} channel ${hallCallRelay.channel}`);
             
-            console.log(`[STATIONARY] Stationary dropoff workflow completed successfully for robot ${robot.serialNumber}`);
+            // Find the channel index for hall_call function
+            const channelIndex = await findRelayChannelForFunction(templateId, hallCallRelay.relay.mac_address, 'hall_call');
             
-        } catch (error) {
-            console.error(`[STATIONARY] Error in stationary dropoff workflow for robot ${robot.serialNumber}:`, error);
-            throw error;
+            // Send command using the correct format
+            await sendRelayCommandByFunction(hallCallRelay.relay.mac_address, channelIndex, true);
+            
+            console.log(`[ELEVATOR] Hall call activated`);
+        },
+        
+        // Method to deactivate hall call (last command when robot exits elevator)
+        async deactivateHallCall() {
+            const hallCallRelay = findRelayForFunction(elevatorRelays, 'hall_call');
+            if (!hallCallRelay) {
+                throw new Error('No hall_call relay found');
+            }
+            
+            console.log(`[ELEVATOR] Deactivating hall call via relay ${hallCallRelay.relay.name} channel ${hallCallRelay.channel}`);
+            
+            // Find the channel index for hall_call function
+            const channelIndex = await findRelayChannelForFunction(templateId, hallCallRelay.relay.mac_address, 'hall_call');
+            
+            // Send command using the correct format
+            await sendRelayCommandByFunction(hallCallRelay.relay.mac_address, channelIndex, false);
+            
+            console.log(`[ELEVATOR] Hall call deactivated`);
+        },
+        
+        // Method to select a floor (works across multiple relays)
+        async selectFloor(floorNumber) {
+            const floorRelay = findRelayForFloor(elevatorRelays, floorNumber);
+            if (!floorRelay) {
+                throw new Error(`No relay found for floor ${floorNumber}`);
+            }
+            
+            console.log(`[ELEVATOR] Selecting floor ${floorNumber} via relay ${floorRelay.relay.name} channel ${floorRelay.channel}`);
+            
+            // Find the channel index for this floor function
+            const channelIndex = await findRelayChannelForFunction(templateId, floorRelay.relay.mac_address, `floor${floorNumber}`);
+            
+            // Send command using the correct format
+            await sendRelayCommandByFunction(floorRelay.relay.mac_address, channelIndex, true);
+            
+            // Wait for the floor selection to be confirmed via DI inputs
+            console.log(`[ELEVATOR] Waiting for floor ${floorNumber} selection confirmation...`);
+            await waitForUnifiedElevatorStatus(templateId, { current_floor: floorNumber }, 10000);
+        },
+        
+        // Method to open doors (works across multiple relays)
+        async openDoor() {
+            const doorRelay = findRelayForFunction(elevatorRelays, 'door_open');
+            if (!doorRelay) {
+                throw new Error('No door_open relay found');
+            }
+            
+            console.log(`[ELEVATOR] Opening doors via relay ${doorRelay.relay.name} channel ${doorRelay.channel}`);
+            
+            // Find the channel index for door_open function
+            const channelIndex = await findRelayChannelForFunction(templateId, doorRelay.relay.mac_address, 'door_open');
+            
+            // Send command using the correct format
+            await sendRelayCommandByFunction(doorRelay.relay.mac_address, channelIndex, true);
+            
+            // Wait for door open confirmation
+            console.log(`[ELEVATOR] Waiting for door open confirmation...`);
+            await waitForUnifiedElevatorStatus(templateId, { door_open: true }, 10000);
+        },
+        
+        // Method to close doors (works across multiple relays)
+        async closeDoor() {
+            const doorRelay = findRelayForFunction(elevatorRelays, 'door_close');
+            if (!doorRelay) {
+                throw new Error('No door_close relay found');
+            }
+            
+            console.log(`[ELEVATOR] Closing doors via relay ${doorRelay.relay.name} channel ${doorRelay.channel}`);
+            
+            // Find the channel index for door_close function
+            const channelIndex = await findRelayChannelForFunction(templateId, doorRelay.relay.mac_address, 'door_close');
+            
+            // Send command using the correct format
+            await sendRelayCommandByFunction(doorRelay.relay.mac_address, channelIndex, true);
+            
+            // Wait for door close confirmation
+            console.log(`[ELEVATOR] Waiting for door close confirmation...`);
+            await waitForUnifiedElevatorStatus(templateId, { door_close: true }, 10000);
+        },
+        
+        // Method to get current unified status
+        async getStatus() {
+            return await getUnifiedElevatorStatus(templateId);
+        },
+        
+        // Method to wait for specific status conditions
+        async waitForStatus(expectedStatus, timeout = 30000) {
+            return await waitForUnifiedElevatorStatus(templateId, expectedStatus, timeout);
         }
-        
-    } else if (type === 'stationary_pickup') {
-        console.log(`[STATIONARY] Starting stationary pickup workflow for robot ${robot.serialNumber}`);
-        
-        try {
-            // 1. Move to shelf_load_docking
-            const move1 = {
-                type: 'standard',
-                target_x: shelfLoadDocking.coordinates[0],
-                target_y: shelfLoadDocking.coordinates[1],
-                target_z: 0,
-                target_ori: parseFloat(shelfLoadDocking.raw_properties.yaw) || 0,
-                creator: 'backend',
-                point_id: shelfLoadDocking.id
-            };
-            const move1Id = await sendMoveTask(robot, move1);
-            await waitForMoveComplete(robot, move1Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after move
+    };
+}
 
-            // 2. Align at shelf_load (stationary rack) with extra precision
-            const align1 = {
-                type: 'align_with_rack',
-                target_x: shelfLoad.coordinates[0],
-                target_y: shelfLoad.coordinates[1],
-                target_z: 0,
-                target_ori: parseFloat(shelfLoad.raw_properties.yaw) || 0,
-                target_accuracy: 0.02, // Higher precision for stationary rack
-                creator: 'backend',
-                point_id: shelfLoad.id
-            };
-            const align1Id = await sendMoveTask(robot, align1);
-            await waitForMoveComplete(robot, align1Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after alignment
-            
-            // Extra wait time for stationary rack alignment
-            await new Promise(resolve => setTimeout(resolve, 3000));
-
-            // 3. Jack up
-            await sendJack(robot, 'jack_up');
-            await clearRobotErrors(robot); // Clear any errors after jack up
-            await new Promise(resolve => setTimeout(resolve, 12000)); // Extra time for stationary rack
-
-            // 4. Move to central_load_docking (with bin lifted)
-            const move2 = {
-                type: 'standard',
-                target_x: centralLoadDocking.coordinates[0],
-                target_y: centralLoadDocking.coordinates[1],
-                target_z: 0.2,
-                target_ori: parseFloat(centralLoadDocking.raw_properties.yaw) || 0,
-                creator: 'backend',
-                point_id: centralLoadDocking.id
-            };
-            const move2Id = await sendMoveTask(robot, move2);
-            await waitForMoveComplete(robot, move2Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after move
-
-            // 5. Move to central_load (align with stationary rack)
-            const move3 = {
-                type: 'align_with_rack',
-                target_x: centralLoad.coordinates[0],
-                target_y: centralLoad.coordinates[1],
-                target_z: 0.2,
-                target_ori: parseFloat(centralLoad.raw_properties.yaw) || 0,
-                target_accuracy: 0.02, // Higher precision for stationary rack
-                creator: 'backend',
-                point_id: centralLoad.id
-            };
-            const move3Id = await sendMoveTask(robot, move3);
-            await waitForMoveComplete(robot, move3Id, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after alignment
-
-            // 6. Jack down
-            await sendJack(robot, 'jack_down');
-            await clearRobotErrors(robot); // Clear any errors after jack down
-            await new Promise(resolve => setTimeout(resolve, 12000));
-
-            // 7. Return to charger
-            const moveCharger = {
-                type: 'charge',
-                target_x: charger.coordinates[0],
-                target_y: charger.coordinates[1],
-                target_z: 0,
-                target_ori: parseFloat(charger.raw_properties.yaw) || 0,
-                target_accuracy: 0.05,
-                charge_retry_count: 5,
-                creator: 'backend',
-                point_id: charger.id
-            };
-            const moveChargerId = await sendMoveTask(robot, moveCharger);
-            await waitForMoveComplete(robot, moveChargerId, 600000, true); // isStationary = true
-            await clearRobotErrors(robot); // Clear any errors after final move
-            
-            console.log(`[STATIONARY] Stationary pickup workflow completed successfully for robot ${robot.serialNumber}`);
-            
-        } catch (error) {
-            console.error(`[STATIONARY] Error in stationary pickup workflow for robot ${robot.serialNumber}:`, error);
-            throw error;
-        }
-        
-    } else {
-        throw new Error(`Invalid stationary task type: ${type}`);
+// Multifloor workflow execution functions
+async function executeMultifloorWorkflow(robot, type, centralLoad, centralLoadDocking, shelfLoad, shelfLoadDocking, charger, options = {}) {
+    console.log(`[MULTIFLOOR] Starting multifloor ${type} workflow for robot ${robot.serialNumber}`);
+    
+    // GUARD: If elevator points are missing, abort and log error
+    if (!options.elevatorWaiting || !options.elevatorInside) {
+        const msg = `[MULTIFLOOR] ERROR: Elevator points missing for robot ${robot.serialNumber}. This robot is likely single-story. Aborting multifloor workflow.`;
+        console.error(msg);
+        throw new Error(msg);
     }
+    
+    try {
+        // Get template ID from options or determine from robot
+        const templateId = options.templateId;
+        if (!templateId) {
+            throw new Error('Template ID is required for multifloor workflows');
+        }
+
+        // Get elevator relays for this template from database
+        const elevatorRelays = await getElevatorRelaysForTemplateFromDB(templateId);
+        
+        if (elevatorRelays.length === 0) {
+            throw new Error('No elevator relays found for this template');
+        }
+
+        console.log(`[MULTIFLOOR] Found ${elevatorRelays.length} elevator relays for template ${templateId}`);
+        
+        // Create elevator controller using shared function
+        const elevatorController = await createElevatorController(elevatorRelays, templateId);
+
+        if (type === 'multifloor_pickup') {
+            await executeMultifloorPickup(robot, elevatorController, centralLoad, centralLoadDocking, shelfLoad, shelfLoadDocking, charger, options);
+        } else if (type === 'multifloor_dropoff') {
+            await executeMultifloorDropoff(robot, elevatorController, centralLoad, centralLoadDocking, shelfLoad, shelfLoadDocking, charger, options);
+        } else {
+            throw new Error(`Invalid multifloor task type: ${type}`);
+        }
+        
+        console.log(`[MULTIFLOOR] Multifloor ${type} workflow completed successfully for robot ${robot.serialNumber}`);
+        
+    } catch (error) {
+        console.error(`[MULTIFLOOR] Error in multifloor ${type} workflow for robot ${robot.serialNumber}:`, error);
+        throw error;
+    }
+}
+
+
+
+// Helper function to get robot connection
+async function getRobotConnection(robot) {
+    const RobotConnection = require('./core/RobotConnection');
+    const robotConnection = new RobotConnection(robot.publicIP, 8090, robot.secretKey);
+    await robotConnection.connect();
+    return robotConnection;
+}
+
+// Helper function to wait for elevator status
+async function waitForElevatorStatus(elevatorController, expectedStatus, timeout = 30000) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`Timeout waiting for elevator status: ${expectedStatus}`));
+        }, timeout);
+
+        const checkStatus = () => {
+            // This would need to be implemented based on your elevator controller's status reporting
+            // For now, we'll use a simple timeout-based approach
+            clearTimeout(timer);
+            resolve();
+        };
+
+        // Listen for status updates from elevator controller
+        elevatorController.once('status_update', (status) => {
+            if (status === expectedStatus) {
+                checkStatus();
+            }
+        });
+
+        // Fallback: resolve after a reasonable delay
+        setTimeout(checkStatus, 5000);
+    });
+}
+
+// Helper function to switch robot to different floor map
+async function switchRobotMap(robotConnection, targetFloor) {
+    const mapName = `Floor${targetFloor}`;
+    console.log(`[MULTIFLOOR] Switching robot to map: ${mapName}`);
+    
+    // Send map switch command to robot
+    const mapSwitchCommand = {
+        id: Date.now().toString(),
+        type: 'switch_map',
+        map_name: mapName
+    };
+    
+    await robotConnection.sendCommand(mapSwitchCommand);
+    
+    // Wait for map switch confirmation
+    await new Promise(resolve => setTimeout(resolve, 3000));
+}
+
+// Multifloor pickup workflow implementation
+async function executeMultifloorPickup(robot, elevatorController, centralLoad, centralLoadDocking, shelfLoad, shelfLoadDocking, charger, options) {
+    console.log(`[MULTIFLOOR] Executing multifloor pickup workflow`);
+    
+    const robotConnection = await getRobotConnection(robot);
+    const currentFloor = options.currentFloor || 1;
+    const targetFloor = options.targetFloor || 2;
+    const chargerFloor = options.chargerFloor || 1; // Floor where charger is located
+    
+    // Determine if this is actually a same-floor operation
+    const isSameFloorOperation = currentFloor === targetFloor;
+    
+    try {
+        // 0. If robot is not on the starting floor, use elevator to get there
+        if (currentFloor !== chargerFloor) {
+            console.log(`[MULTIFLOOR] Step 0: Robot needs to move from floor ${chargerFloor} to floor ${currentFloor}`);
+            
+            // 0a. Move to elevator waiting on charger floor
+            console.log(`[MULTIFLOOR] Step 0a: Moving to elevator waiting on charger floor`);
+            const chargerElevatorWaiting = await getElevatorWaitingPoint(robot, chargerFloor);
+            const move0a = {
+                type: 'standard',
+                target_x: chargerElevatorWaiting.coordinates[0],
+                target_y: chargerElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorWaiting.id
+            };
+            const move0aId = await sendMoveTask(robot, move0a);
+            await waitForMoveComplete(robot, move0aId);
+
+            // 0b. Call elevator to charger floor
+            console.log(`[MULTIFLOOR] Step 0b: Calling elevator to floor ${chargerFloor}`);
+            await elevatorController.selectFloor(chargerFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 0c. Open elevator doors
+            console.log(`[MULTIFLOOR] Step 0c: Opening elevator doors`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 0d. Move to elevator inside on charger floor
+            console.log(`[MULTIFLOOR] Step 0d: Moving to elevator inside on charger floor`);
+            const chargerElevatorInside = await getElevatorInsidePoint(robot, chargerFloor);
+            const move0d = {
+                type: 'standard',
+                target_x: chargerElevatorInside.coordinates[0],
+                target_y: chargerElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorInside.id
+            };
+            const move0dId = await sendMoveTask(robot, move0d);
+            await waitForMoveComplete(robot, move0dId);
+
+            // 0e. Close elevator doors
+            console.log(`[MULTIFLOOR] Step 0e: Closing elevator doors`);
+            await elevatorController.closeDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_closed');
+
+            // 0f. Move elevator to starting floor
+            console.log(`[MULTIFLOOR] Step 0f: Moving elevator to floor ${currentFloor}`);
+            await elevatorController.selectFloor(currentFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 0g. Open doors at starting floor
+            console.log(`[MULTIFLOOR] Step 0g: Opening doors at starting floor`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 0h. Switch robot to starting floor map
+            console.log(`[MULTIFLOOR] Step 0h: Switching to starting floor map`);
+            await switchRobotMap(robotConnection, currentFloor);
+
+            // 0i. Localize at elevator inside on starting floor
+            console.log(`[MULTIFLOOR] Step 0i: Localizing at elevator inside on starting floor`);
+            const startElevatorInside = await getElevatorInsidePoint(robot, currentFloor);
+            const move0i = {
+                type: 'localize',
+                target_x: startElevatorInside.coordinates[0],
+                target_y: startElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(startElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: startElevatorInside.id
+            };
+            const move0iId = await sendMoveTask(robot, move0i);
+            await waitForMoveComplete(robot, move0iId);
+
+            // 0j. Move to elevator waiting on starting floor
+            console.log(`[MULTIFLOOR] Step 0j: Moving to elevator waiting on starting floor`);
+            const startElevatorWaiting = await getElevatorWaitingPoint(robot, currentFloor);
+            const move0j = {
+                type: 'standard',
+                target_x: startElevatorWaiting.coordinates[0],
+                target_y: startElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(startElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: startElevatorWaiting.id
+            };
+            const move0jId = await sendMoveTask(robot, move0j);
+            await waitForMoveComplete(robot, move0jId);
+
+            // 0k. Release elevator control
+            console.log(`[MULTIFLOOR] Step 0k: Releasing elevator control`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        // 1. Move to shelf docking
+        console.log(`[MULTIFLOOR] Step 1: Moving to shelf docking`);
+        const move1 = {
+            type: 'standard',
+            target_x: shelfLoadDocking.coordinates[0],
+            target_y: shelfLoadDocking.coordinates[1],
+            target_z: 0,
+            target_ori: parseFloat(shelfLoadDocking.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: shelfLoadDocking.id
+        };
+        const move1Id = await sendMoveTask(robot, move1);
+        await waitForMoveComplete(robot, move1Id);
+
+        // 2. Align with shelf load
+        console.log(`[MULTIFLOOR] Step 2: Aligning with shelf load`);
+        const align1 = {
+            type: 'align_with_rack',
+            target_x: shelfLoad.coordinates[0],
+            target_y: shelfLoad.coordinates[1],
+            target_z: 0,
+            target_ori: parseFloat(shelfLoad.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: shelfLoad.id
+        };
+        const align1Id = await sendMoveTask(robot, align1);
+        await waitForMoveComplete(robot, align1Id);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // 3. Jack up
+        console.log(`[MULTIFLOOR] Step 3: Jacking up`);
+        await sendJack(robot, 'jack_up');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+
+        // 4-14. Elevator steps (only if different floors)
+        if (!isSameFloorOperation) {
+            // 4. Move to elevator waiting
+            console.log(`[MULTIFLOOR] Step 4: Moving to elevator waiting`);
+            const elevatorWaiting = await getElevatorWaitingPoint(robot, currentFloor);
+            const move2 = {
+                type: 'standard',
+                target_x: elevatorWaiting.coordinates[0],
+                target_y: elevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(elevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: elevatorWaiting.id
+            };
+            const move2Id = await sendMoveTask(robot, move2);
+            await waitForMoveComplete(robot, move2Id);
+
+            // 5. Call elevator to current floor
+            console.log(`[MULTIFLOOR] Step 5: Calling elevator to floor ${currentFloor}`);
+            await elevatorController.selectFloor(currentFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 6. Open elevator doors
+            console.log(`[MULTIFLOOR] Step 6: Opening elevator doors`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 7. Move to elevator inside
+            console.log(`[MULTIFLOOR] Step 7: Moving to elevator inside`);
+            const elevatorInside = await getElevatorInsidePoint(robot, currentFloor);
+            const move3 = {
+                type: 'standard',
+                target_x: elevatorInside.coordinates[0],
+                target_y: elevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(elevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: elevatorInside.id
+            };
+            const move3Id = await sendMoveTask(robot, move3);
+            await waitForMoveComplete(robot, move3Id);
+
+            // 8. Close elevator doors
+            console.log(`[MULTIFLOOR] Step 8: Closing elevator doors`);
+            await elevatorController.closeDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_closed');
+
+            // 9. Move elevator to target floor
+            console.log(`[MULTIFLOOR] Step 9: Moving elevator to floor ${targetFloor}`);
+            await elevatorController.selectFloor(targetFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 10. Open doors at target floor
+            console.log(`[MULTIFLOOR] Step 10: Opening doors at target floor`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 11. Switch robot to target floor map
+            console.log(`[MULTIFLOOR] Step 11: Switching to target floor map`);
+            await switchRobotMap(robotConnection, targetFloor);
+
+            // 12. Localize at elevator inside on target floor
+            console.log(`[MULTIFLOOR] Step 12: Localizing at elevator inside on target floor`);
+            const targetElevatorInside = await getElevatorInsidePoint(robot, targetFloor);
+            const move4 = {
+                type: 'localize',
+                target_x: targetElevatorInside.coordinates[0],
+                target_y: targetElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(targetElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: targetElevatorInside.id
+            };
+            const move4Id = await sendMoveTask(robot, move4);
+            await waitForMoveComplete(robot, move4Id);
+
+            // 13. Move to elevator waiting on target floor
+            console.log(`[MULTIFLOOR] Step 13: Moving to elevator waiting on target floor`);
+            const targetElevatorWaiting = await getElevatorWaitingPoint(robot, targetFloor);
+            const move5 = {
+                type: 'standard',
+                target_x: targetElevatorWaiting.coordinates[0],
+                target_y: targetElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(targetElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: targetElevatorWaiting.id
+            };
+            const move5Id = await sendMoveTask(robot, move5);
+            await waitForMoveComplete(robot, move5Id);
+
+            // 14. Release elevator control
+            console.log(`[MULTIFLOOR] Step 14: Releasing elevator control`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        } else {
+            console.log(`[MULTIFLOOR] Skipping elevator steps 4-14 (same floor operation)`);
+        }
+
+        // 15. Move to central load docking
+        console.log(`[MULTIFLOOR] Step 15: Moving to central load docking`);
+        const move6 = {
+            type: 'standard',
+            target_x: centralLoadDocking.coordinates[0],
+            target_y: centralLoadDocking.coordinates[1],
+            target_z: 0.2,
+            target_ori: parseFloat(centralLoadDocking.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: centralLoadDocking.id
+        };
+        const move6Id = await sendMoveTask(robot, move6);
+        await waitForMoveComplete(robot, move6Id);
+
+        // 16. Align with central load
+        console.log(`[MULTIFLOOR] Step 16: Aligning with central load`);
+        const move7 = {
+            type: 'align_with_rack',
+            target_x: centralLoad.coordinates[0],
+            target_y: centralLoad.coordinates[1],
+            target_z: 0.2,
+            target_ori: parseFloat(centralLoad.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: centralLoad.id
+        };
+        const move7Id = await sendMoveTask(robot, move7);
+        await waitForMoveComplete(robot, move7Id);
+
+        // 17. Jack down
+        console.log(`[MULTIFLOOR] Step 17: Jacking down`);
+        await sendJack(robot, 'jack_down');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+
+        // 18-29. Return elevator steps (only if different floors)
+        if (!isSameFloorOperation) {
+            // 18. Move to elevator waiting on target floor
+            console.log(`[MULTIFLOOR] Step 18: Moving to elevator waiting on target floor`);
+            const returnElevatorWaiting = await getElevatorWaitingPoint(robot, targetFloor);
+            const move8 = {
+                type: 'standard',
+                target_x: returnElevatorWaiting.coordinates[0],
+                target_y: returnElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(returnElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: returnElevatorWaiting.id
+            };
+            const move8Id = await sendMoveTask(robot, move8);
+            await waitForMoveComplete(robot, move8Id);
+
+            // 19. Call elevator to target floor
+            console.log(`[MULTIFLOOR] Step 19: Calling elevator to floor ${targetFloor}`);
+            await elevatorController.selectFloor(targetFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 20. Open elevator doors
+            console.log(`[MULTIFLOOR] Step 20: Opening elevator doors`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 21. Move to elevator inside on target floor
+            console.log(`[MULTIFLOOR] Step 21: Moving to elevator inside on target floor`);
+            const returnElevatorInside = await getElevatorInsidePoint(robot, targetFloor);
+            const move9 = {
+                type: 'standard',
+                target_x: returnElevatorInside.coordinates[0],
+                target_y: returnElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(returnElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: returnElevatorInside.id
+            };
+            const move9Id = await sendMoveTask(robot, move9);
+            await waitForMoveComplete(robot, move9Id);
+
+            // 22. Close elevator doors
+            console.log(`[MULTIFLOOR] Step 22: Closing elevator doors`);
+            await elevatorController.closeDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_closed');
+
+            // 23. Move elevator to charger floor
+            console.log(`[MULTIFLOOR] Step 23: Moving elevator to floor ${chargerFloor}`);
+            await elevatorController.selectFloor(chargerFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 24. Open doors at charger floor
+            console.log(`[MULTIFLOOR] Step 24: Opening doors at charger floor`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 25. Switch robot to charger floor map
+            console.log(`[MULTIFLOOR] Step 25: Switching to charger floor map`);
+            await switchRobotMap(robotConnection, chargerFloor);
+
+            // 26. Localize at elevator inside on charger floor
+            console.log(`[MULTIFLOOR] Step 26: Localizing at elevator inside on charger floor`);
+            const chargerElevatorInsideReturn = await getElevatorInsidePoint(robot, chargerFloor);
+            const move10 = {
+                type: 'localize',
+                target_x: chargerElevatorInsideReturn.coordinates[0],
+                target_y: chargerElevatorInsideReturn.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorInsideReturn.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorInsideReturn.id
+            };
+            const move10Id = await sendMoveTask(robot, move10);
+            await waitForMoveComplete(robot, move10Id);
+
+            // 27. Move to elevator waiting on charger floor
+            console.log(`[MULTIFLOOR] Step 27: Moving to elevator waiting on charger floor`);
+            const chargerElevatorWaitingReturn = await getElevatorWaitingPoint(robot, chargerFloor);
+            const move11 = {
+                type: 'standard',
+                target_x: chargerElevatorWaitingReturn.coordinates[0],
+                target_y: chargerElevatorWaitingReturn.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorWaitingReturn.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorWaitingReturn.id
+            };
+            const move11Id = await sendMoveTask(robot, move11);
+            await waitForMoveComplete(robot, move11Id);
+
+            // 28. Release elevator control
+            console.log(`[MULTIFLOOR] Step 28: Releasing elevator control`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        } else {
+            console.log(`[MULTIFLOOR] Skipping elevator return steps 18-28 (same floor operation)`);
+        }
+
+        // 29. Return to charger
+        console.log(`[MULTIFLOOR] Step 29: Returning to charger`);
+        const moveCharger = {
+            type: 'charge',
+            target_x: charger.coordinates[0],
+            target_y: charger.coordinates[1],
+            target_z: 0,
+            target_ori: parseFloat(charger.raw_properties.yaw) || 0,
+            target_accuracy: 0.05,
+            charge_retry_count: 5,
+            creator: 'backend',
+            point_id: charger.id
+        };
+        const moveChargerId = await sendMoveTask(robot, moveCharger);
+        await waitForMoveComplete(robot, moveChargerId);
+
+        console.log(`[MULTIFLOOR] Multifloor pickup workflow completed successfully`);
+        
+    } finally {
+        robotConnection.disconnect();
+    }
+}
+
+// Multifloor dropoff workflow implementation
+async function executeMultifloorDropoff(robot, elevatorController, centralLoad, centralLoadDocking, shelfLoad, shelfLoadDocking, charger, options) {
+    console.log(`[MULTIFLOOR] Executing multifloor dropoff workflow`);
+    
+    const robotConnection = await getRobotConnection(robot);
+    const currentFloor = options.currentFloor || 1;
+    const targetFloor = options.targetFloor || 2;
+    const chargerFloor = options.chargerFloor || 1; // Floor where charger is located
+    
+    // Determine if this is actually a same-floor operation
+    const isSameFloorOperation = currentFloor === targetFloor;
+    
+    try {
+        // 0. If robot is not on the starting floor, use elevator to get there
+        if (currentFloor !== chargerFloor) {
+            console.log(`[MULTIFLOOR] Step 0: Robot needs to move from floor ${chargerFloor} to floor ${currentFloor}`);
+            
+            // 0a. Move to elevator waiting on charger floor
+            console.log(`[MULTIFLOOR] Step 0a: Moving to elevator waiting on charger floor`);
+            const chargerElevatorWaiting = await getElevatorWaitingPoint(robot, chargerFloor);
+            const move0a = {
+                type: 'standard',
+                target_x: chargerElevatorWaiting.coordinates[0],
+                target_y: chargerElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorWaiting.id
+            };
+            const move0aId = await sendMoveTask(robot, move0a);
+            await waitForMoveComplete(robot, move0aId);
+
+            // 0b. Call elevator to charger floor
+            console.log(`[MULTIFLOOR] Step 0b: Calling elevator to floor ${chargerFloor}`);
+            await elevatorController.selectFloor(chargerFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 0c. Open elevator doors
+            console.log(`[MULTIFLOOR] Step 0c: Opening elevator doors`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 0d. Move to elevator inside on charger floor
+            console.log(`[MULTIFLOOR] Step 0d: Moving to elevator inside on charger floor`);
+            const chargerElevatorInside = await getElevatorInsidePoint(robot, chargerFloor);
+            const move0d = {
+                type: 'standard',
+                target_x: chargerElevatorInside.coordinates[0],
+                target_y: chargerElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorInside.id
+            };
+            const move0dId = await sendMoveTask(robot, move0d);
+            await waitForMoveComplete(robot, move0dId);
+
+            // 0e. Close elevator doors
+            console.log(`[MULTIFLOOR] Step 0e: Closing elevator doors`);
+            await elevatorController.closeDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_closed');
+
+            // 0f. Move elevator to starting floor
+            console.log(`[MULTIFLOOR] Step 0f: Moving elevator to floor ${currentFloor}`);
+            await elevatorController.selectFloor(currentFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 0g. Open doors at starting floor
+            console.log(`[MULTIFLOOR] Step 0g: Opening doors at starting floor`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 0h. Switch robot to starting floor map
+            console.log(`[MULTIFLOOR] Step 0h: Switching to starting floor map`);
+            await switchRobotMap(robotConnection, currentFloor);
+
+            // 0i. Localize at elevator inside on starting floor
+            console.log(`[MULTIFLOOR] Step 0i: Localizing at elevator inside on starting floor`);
+            const startElevatorInside = await getElevatorInsidePoint(robot, currentFloor);
+            const move0i = {
+                type: 'localize',
+                target_x: startElevatorInside.coordinates[0],
+                target_y: startElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(startElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: startElevatorInside.id
+            };
+            const move0iId = await sendMoveTask(robot, move0i);
+            await waitForMoveComplete(robot, move0iId);
+
+            // 0j. Move to elevator waiting on starting floor
+            console.log(`[MULTIFLOOR] Step 0j: Moving to elevator waiting on starting floor`);
+            const startElevatorWaiting = await getElevatorWaitingPoint(robot, currentFloor);
+            const move0j = {
+                type: 'standard',
+                target_x: startElevatorWaiting.coordinates[0],
+                target_y: startElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(startElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: startElevatorWaiting.id
+            };
+            const move0jId = await sendMoveTask(robot, move0j);
+            await waitForMoveComplete(robot, move0jId);
+
+            // 0k. Release elevator control
+            console.log(`[MULTIFLOOR] Step 0k: Releasing elevator control`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        // 1. Move to central load docking
+        console.log(`[MULTIFLOOR] Step 1: Moving to central load docking`);
+        const move1 = {
+            type: 'standard',
+            target_x: centralLoadDocking.coordinates[0],
+            target_y: centralLoadDocking.coordinates[1],
+            target_z: 0,
+            target_ori: parseFloat(centralLoadDocking.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: centralLoadDocking.id
+        };
+        const move1Id = await sendMoveTask(robot, move1);
+        await waitForMoveComplete(robot, move1Id);
+
+        // 2. Align with central load
+        console.log(`[MULTIFLOOR] Step 2: Aligning with central load`);
+        const align1 = {
+            type: 'align_with_rack',
+            target_x: centralLoad.coordinates[0],
+            target_y: centralLoad.coordinates[1],
+            target_z: 0,
+            target_ori: parseFloat(centralLoad.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: centralLoad.id
+        };
+        const align1Id = await sendMoveTask(robot, align1);
+        await waitForMoveComplete(robot, align1Id);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // 3. Jack up
+        console.log(`[MULTIFLOOR] Step 3: Jacking up`);
+        await sendJack(robot, 'jack_up');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+
+        // 4-14. Elevator steps (only if different floors)
+        if (!isSameFloorOperation) {
+            // 4. Move to elevator waiting
+            console.log(`[MULTIFLOOR] Step 4: Moving to elevator waiting`);
+            const elevatorWaiting = await getElevatorWaitingPoint(robot, currentFloor);
+            const move2 = {
+                type: 'standard',
+                target_x: elevatorWaiting.coordinates[0],
+                target_y: elevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(elevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: elevatorWaiting.id
+            };
+            const move2Id = await sendMoveTask(robot, move2);
+            await waitForMoveComplete(robot, move2Id);
+
+            // 5. Call elevator to current floor
+            console.log(`[MULTIFLOOR] Step 5: Calling elevator to floor ${currentFloor}`);
+            await elevatorController.selectFloor(currentFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 6. Open elevator doors
+            console.log(`[MULTIFLOOR] Step 6: Opening elevator doors`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 7. Move to elevator inside
+            console.log(`[MULTIFLOOR] Step 7: Moving to elevator inside`);
+            const elevatorInside = await getElevatorInsidePoint(robot, currentFloor);
+            const move3 = {
+                type: 'standard',
+                target_x: elevatorInside.coordinates[0],
+                target_y: elevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(elevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: elevatorInside.id
+            };
+            const move3Id = await sendMoveTask(robot, move3);
+            await waitForMoveComplete(robot, move3Id);
+
+            // 8. Close elevator doors
+            console.log(`[MULTIFLOOR] Step 8: Closing elevator doors`);
+            await elevatorController.closeDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_closed');
+
+            // 9. Move elevator to target floor
+            console.log(`[MULTIFLOOR] Step 9: Moving elevator to floor ${targetFloor}`);
+            await elevatorController.selectFloor(targetFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 10. Open doors at target floor
+            console.log(`[MULTIFLOOR] Step 10: Opening doors at target floor`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 11. Switch robot to target floor map
+            console.log(`[MULTIFLOOR] Step 11: Switching to target floor map`);
+            await switchRobotMap(robotConnection, targetFloor);
+
+            // 12. Localize at elevator inside on target floor
+            console.log(`[MULTIFLOOR] Step 12: Localizing at elevator inside on target floor`);
+            const targetElevatorInside = await getElevatorInsidePoint(robot, targetFloor);
+            const move4 = {
+                type: 'localize',
+                target_x: targetElevatorInside.coordinates[0],
+                target_y: targetElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(targetElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: targetElevatorInside.id
+            };
+            const move4Id = await sendMoveTask(robot, move4);
+            await waitForMoveComplete(robot, move4Id);
+
+            // 13. Move to elevator waiting on target floor
+            console.log(`[MULTIFLOOR] Step 13: Moving to elevator waiting on target floor`);
+            const targetElevatorWaiting = await getElevatorWaitingPoint(robot, targetFloor);
+            const move5 = {
+                type: 'standard',
+                target_x: targetElevatorWaiting.coordinates[0],
+                target_y: targetElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(targetElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: targetElevatorWaiting.id
+            };
+            const move5Id = await sendMoveTask(robot, move5);
+            await waitForMoveComplete(robot, move5Id);
+
+            // 14. Release elevator control
+            console.log(`[MULTIFLOOR] Step 14: Releasing elevator control`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        } else {
+            console.log(`[MULTIFLOOR] Skipping elevator steps 4-14 (same floor operation)`);
+        }
+
+        // 15. Move to shelf load docking
+        console.log(`[MULTIFLOOR] Step 15: Moving to shelf load docking`);
+        const move6 = {
+            type: 'standard',
+            target_x: shelfLoadDocking.coordinates[0],
+            target_y: shelfLoadDocking.coordinates[1],
+            target_z: 0.2,
+            target_ori: parseFloat(shelfLoadDocking.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: shelfLoadDocking.id
+        };
+        const move6Id = await sendMoveTask(robot, move6);
+        await waitForMoveComplete(robot, move6Id);
+
+        // 16. Align with shelf load
+        console.log(`[MULTIFLOOR] Step 16: Aligning with shelf load`);
+        const move7 = {
+            type: 'align_with_rack',
+            target_x: shelfLoad.coordinates[0],
+            target_y: shelfLoad.coordinates[1],
+            target_z: 0.2,
+            target_ori: parseFloat(shelfLoad.raw_properties.yaw) || 0,
+            creator: 'backend',
+            point_id: shelfLoad.id
+        };
+        const move7Id = await sendMoveTask(robot, move7);
+        await waitForMoveComplete(robot, move7Id);
+
+        // 17. Jack down
+        console.log(`[MULTIFLOOR] Step 17: Jacking down`);
+        await sendJack(robot, 'jack_down');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+
+        // 18-29. Return elevator steps (only if different floors)
+        if (!isSameFloorOperation) {
+            // 18. Move to elevator waiting on target floor
+            console.log(`[MULTIFLOOR] Step 18: Moving to elevator waiting on target floor`);
+            const returnElevatorWaiting = await getElevatorWaitingPoint(robot, targetFloor);
+            const move8 = {
+                type: 'standard',
+                target_x: returnElevatorWaiting.coordinates[0],
+                target_y: returnElevatorWaiting.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(returnElevatorWaiting.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: returnElevatorWaiting.id
+            };
+            const move8Id = await sendMoveTask(robot, move8);
+            await waitForMoveComplete(robot, move8Id);
+
+            // 19. Call elevator to target floor
+            console.log(`[MULTIFLOOR] Step 19: Calling elevator to floor ${targetFloor}`);
+            await elevatorController.selectFloor(targetFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 20. Open elevator doors
+            console.log(`[MULTIFLOOR] Step 20: Opening elevator doors`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 21. Move to elevator inside on target floor
+            console.log(`[MULTIFLOOR] Step 21: Moving to elevator inside on target floor`);
+            const returnElevatorInside = await getElevatorInsidePoint(robot, targetFloor);
+            const move9 = {
+                type: 'standard',
+                target_x: returnElevatorInside.coordinates[0],
+                target_y: returnElevatorInside.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(returnElevatorInside.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: returnElevatorInside.id
+            };
+            const move9Id = await sendMoveTask(robot, move9);
+            await waitForMoveComplete(robot, move9Id);
+
+            // 22. Close elevator doors
+            console.log(`[MULTIFLOOR] Step 22: Closing elevator doors`);
+            await elevatorController.closeDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_closed');
+
+            // 23. Move elevator to charger floor
+            console.log(`[MULTIFLOOR] Step 23: Moving elevator to floor ${chargerFloor}`);
+            await elevatorController.selectFloor(chargerFloor);
+            await waitForElevatorStatus(elevatorController, 'at_floor');
+
+            // 24. Open doors at charger floor
+            console.log(`[MULTIFLOOR] Step 24: Opening doors at charger floor`);
+            await elevatorController.openDoor();
+            await waitForElevatorStatus(elevatorController, 'doors_open');
+
+            // 25. Switch robot to charger floor map
+            console.log(`[MULTIFLOOR] Step 25: Switching to charger floor map`);
+            await switchRobotMap(robotConnection, chargerFloor);
+
+            // 26. Localize at elevator inside on charger floor
+            console.log(`[MULTIFLOOR] Step 26: Localizing at elevator inside on charger floor`);
+            const chargerElevatorInsideReturn = await getElevatorInsidePoint(robot, chargerFloor);
+            const move10 = {
+                type: 'localize',
+                target_x: chargerElevatorInsideReturn.coordinates[0],
+                target_y: chargerElevatorInsideReturn.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorInsideReturn.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorInsideReturn.id
+            };
+            const move10Id = await sendMoveTask(robot, move10);
+            await waitForMoveComplete(robot, move10Id);
+
+            // 27. Move to elevator waiting on charger floor
+            console.log(`[MULTIFLOOR] Step 27: Moving to elevator waiting on charger floor`);
+            const chargerElevatorWaitingReturn = await getElevatorWaitingPoint(robot, chargerFloor);
+            const move11 = {
+                type: 'standard',
+                target_x: chargerElevatorWaitingReturn.coordinates[0],
+                target_y: chargerElevatorWaitingReturn.coordinates[1],
+                target_z: 0.2,
+                target_ori: parseFloat(chargerElevatorWaitingReturn.raw_properties.yaw) || 0,
+                creator: 'backend',
+                point_id: chargerElevatorWaitingReturn.id
+            };
+            const move11Id = await sendMoveTask(robot, move11);
+            await waitForMoveComplete(robot, move11Id);
+
+            // 28. Release elevator control
+            console.log(`[MULTIFLOOR] Step 28: Releasing elevator control`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        } else {
+            console.log(`[MULTIFLOOR] Skipping elevator return steps 18-28 (same floor operation)`);
+        }
+
+        // 29. Return to charger
+        console.log(`[MULTIFLOOR] Step 29: Returning to charger`);
+        const moveCharger = {
+            type: 'charge',
+            target_x: charger.coordinates[0],
+            target_y: charger.coordinates[1],
+            target_z: 0,
+            target_ori: parseFloat(charger.raw_properties.yaw) || 0,
+            target_accuracy: 0.05,
+            charge_retry_count: 5,
+            creator: 'backend',
+            point_id: charger.id
+        };
+        const moveChargerId = await sendMoveTask(robot, moveCharger);
+        await waitForMoveComplete(robot, moveChargerId);
+
+        console.log(`[MULTIFLOOR] Multifloor dropoff workflow completed successfully`);
+        
+    } finally {
+        robotConnection.disconnect();
+    }
+}
+
+// Helper functions to get elevator points
+async function getElevatorWaitingPoint(robot, floor) {
+    const mapName = `Floor${floor}`;
+    const mapResult = await db.query(
+        'SELECT * FROM maps WHERE robot_serial_number = $1 AND map_name = $2',
+        [robot.serialNumber, mapName]
+    );
+    
+    if (mapResult.rows.length === 0) {
+        throw new Error(`Map ${mapName} not found for robot ${robot.serialNumber}`);
+    }
+    
+    let features = mapResult.rows[0].features;
+    if (typeof features === 'string') {
+        features = JSON.parse(features);
+    }
+    
+    const elevatorWaiting = features.find(f => f.name === 'Elevator_waiting');
+    if (!elevatorWaiting) {
+        throw new Error(`Elevator waiting point not found in map ${mapName}`);
+    }
+    
+    return elevatorWaiting;
+}
+
+async function getElevatorInsidePoint(robot, floor) {
+    const mapName = `Floor${floor}`;
+    const mapResult = await db.query(
+        'SELECT * FROM maps WHERE robot_serial_number = $1 AND map_name = $2',
+        [robot.serialNumber, mapName]
+    );
+    
+    if (mapResult.rows.length === 0) {
+        throw new Error(`Map ${mapName} not found for robot ${robot.serialNumber}`);
+    }
+    
+    let features = mapResult.rows[0].features;
+    if (typeof features === 'string') {
+        features = JSON.parse(features);
+    }
+    
+    const elevatorInside = features.find(f => f.name === 'Elevator_inside');
+    if (!elevatorInside) {
+        throw new Error(`Elevator inside point not found in map ${mapName}`);
+    }
+    
+    return elevatorInside;
 }
 
 app.post('/api/templates/:id/tasks', authenticateToken, async (req, res) => {
@@ -1870,20 +3057,31 @@ setInterval(async () => {
                     }
                 }
                 
-                // Check if template has stationary enabled
-                const templateResult = await db.query('SELECT stationary FROM templates WHERE id = $1', [task.template_id]);
-                const isStationary = templateResult.rows.length > 0 ? templateResult.rows[0].stationary : false;
+                // Check if template has multifloor enabled
+                const templateResult = await db.query('SELECT multifloor FROM templates WHERE id = $1', [task.template_id]);
+                const isMultifloor = templateResult.rows.length > 0 ? templateResult.rows[0].multifloor : false;
                 
-                // Determine workflow type based on template setting
+                // Determine workflow type based on template settings and elevator points
                 let workflowType = enrichedData.type;
-                if (isStationary && (enrichedData.type === 'pickup' || enrichedData.type === 'dropoff')) {
-                    workflowType = `stationary_${enrichedData.type}`;
-                    console.log(`[QUEUE-MANAGER] Using stationary workflow: ${workflowType}`);
+                if (enrichedData.type === 'pickup' || enrichedData.type === 'dropoff') {
+                    // Check if elevator points are available (for multi-story robots)
+                    const hasElevatorPoints = enrichedData.elevatorWaiting && enrichedData.elevatorInside;
+                    
+                    if (hasElevatorPoints) {
+                        // Robot has elevator points, use template settings
+                        workflowType = determineWorkflowType(isMultifloor, enrichedData.type);
+                        console.log(`[QUEUE-MANAGER] Template settings - Multifloor: ${isMultifloor}`);
+                        console.log(`[QUEUE-MANAGER] Robot has elevator points, using workflow: ${workflowType}`);
+                    } else {
+                        // Robot is single-story, force single-story workflow
+                        workflowType = enrichedData.type;
+                        console.log(`[QUEUE-MANAGER] Robot is single-story (no elevator points), forcing workflow: ${workflowType}`);
+                    }
                 }
                 
                 // Execute appropriate workflow
-                if (workflowType.startsWith('stationary_')) {
-                    await executeStationaryWorkflow(
+                if (workflowType.startsWith('multifloor_')) {
+                    await executeMultifloorWorkflow(
                         enrichedData.robot,
                         workflowType,
                         enrichedData.centralLoad,
@@ -1891,7 +3089,12 @@ setInterval(async () => {
                         enrichedData.shelfLoad,
                         enrichedData.shelfLoadDocking,
                         enrichedData.charger,
-                        enrichedData.options
+                        {
+                            ...enrichedData.options,
+                            elevatorWaiting: enrichedData.elevatorWaiting,
+                            elevatorInside: enrichedData.elevatorInside,
+                            templateId: task.template_id
+                        }
                     );
                 } else {
                 await executeWorkflow(
@@ -1902,7 +3105,12 @@ setInterval(async () => {
                     enrichedData.shelfLoad,
                     enrichedData.shelfLoadDocking,
                     enrichedData.charger,
-                    enrichedData.options
+                    {
+                        ...enrichedData.options,
+                        elevatorWaiting: enrichedData.elevatorWaiting,
+                        elevatorInside: enrichedData.elevatorInside,
+                        templateId: task.template_id
+                    }
                 );
                 }
                 await db.query(
@@ -2128,8 +3336,2082 @@ setInterval(async () => {
     }
 }, 30000);
 
+// === Relay Management Endpoints ===
+
+// Get all registered relays
+app.get('/api/relays', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT r.*, t.name as template_name, t.id as template_id
+            FROM relays r
+            LEFT JOIN templates t ON r.template_id = t.id
+            ORDER BY r.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching relays:', err);
+        res.status(500).json({ error: 'Failed to fetch relays' });
+    }
+});
+
+// === Enhanced Relay Management Endpoints ===
+
+// Get all relay configurations
+app.get('/api/relay-configurations', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT * FROM relay_configurations 
+            ORDER BY created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching relay configurations:', err);
+        res.status(500).json({ error: 'Failed to fetch relay configurations' });
+    }
+});
+
+// Create new relay configuration
+app.post('/api/relay-configurations', authenticateToken, async (req, res) => {
+    const { relay_id, relay_name, ssid, password, mac_address } = req.body;
+    
+    console.log('POST /api/relay-configurations called');
+    console.log('Incoming data:', req.body);
+    
+    if (!relay_id || !relay_name || !ssid || !password) {
+        console.log('Missing required fields');
+        return res.status(400).json({ error: 'Relay ID, name, SSID, and password are required' });
+    }
+    
+    try {
+        // Check if configuration already exists
+        const existingResult = await db.query('SELECT * FROM relay_configurations WHERE relay_id = $1', [relay_id]);
+        if (existingResult.rows.length > 0) {
+            console.log('Duplicate relay_id');
+            return res.status(409).json({ error: 'Relay configuration with this ID already exists' });
+        }
+        
+        // Insert new configuration with MAC address support
+        const result = await db.query(`
+            INSERT INTO relay_configurations (relay_id, relay_name, ssid, password, mac_address, ip_address, port)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *
+        `, [
+            relay_id, 
+            relay_name, 
+            ssid, 
+            password, 
+            mac_address || null, // MAC address (optional)
+            null, // ip_address - will be auto-assigned
+            40000 // port - default to 40000 for skytechautomated.com
+        ]);
+        
+        console.log('Insert result:', result.rows[0]);
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error creating relay configuration:', err);
+        res.status(500).json({ error: 'Failed to create relay configuration', details: err.message });
+    }
+});
+
+// Get all connected relays
+app.get('/api/connected-relays', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT cr.*, rc.relay_id, rc.relay_name as config_name
+            FROM connected_relays cr
+            LEFT JOIN relay_configurations rc ON cr.relay_config_id = rc.id
+            ORDER BY cr.last_seen DESC
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching connected relays:', err);
+        res.status(500).json({ error: 'Failed to fetch connected relays' });
+    }
+});
+
+// Get relay statistics
+app.get('/api/relay-statistics', authenticateToken, async (req, res) => {
+    try {
+        const [configsResult, connectedResult, onlineResult, offlineResult] = await Promise.all([
+            db.query('SELECT COUNT(*) as count FROM relay_configurations'),
+            db.query('SELECT COUNT(*) as count FROM connected_relays'),
+            db.query("SELECT COUNT(*) as count FROM connected_relays WHERE status = 'online'"),
+            db.query("SELECT COUNT(*) as count FROM connected_relays WHERE status = 'offline'")
+        ]);
+        
+        res.json({
+            total_configs: parseInt(configsResult.rows[0].count),
+            total_connected: parseInt(connectedResult.rows[0].count),
+            online_relays: parseInt(onlineResult.rows[0].count),
+            offline_relays: parseInt(offlineResult.rows[0].count)
+        });
+    } catch (err) {
+        console.error('Error fetching relay statistics:', err);
+        res.status(500).json({ error: 'Failed to fetch relay statistics' });
+    }
+});
+
+// === Relay Programming Endpoints ===
+
+// Get available ports for programming
+app.get('/api/relay-programming/ports', authenticateToken, async (req, res) => {
+    try {
+        console.log('Scanning for available COM ports...');
+        
+        // Use serialport library to scan for available ports
+        const ports = await SerialPort.list();
+        
+        console.log(`Found ${ports.length} available ports:`, ports.map(p => p.path));
+        
+        // Format the ports for the frontend
+        const formattedPorts = ports.map(port => ({
+            path: port.path,
+            manufacturer: port.manufacturer || 'Unknown',
+            serialNumber: port.serialNumber || 'No Serial',
+            pnpId: port.pnpId || null,
+            locationId: port.locationId || null,
+            productId: port.productId || null,
+            vendorId: port.vendorId || null
+        }));
+        
+        res.json(formattedPorts);
+    } catch (err) {
+        console.error('Error scanning ports:', err);
+        res.status(500).json({ error: 'Failed to scan ports', details: err.message });
+    }
+});
+
+// Connect to relay for programming
+app.post('/api/relay-programming/connect', authenticateToken, async (req, res) => {
+    const { port } = req.body;
+    
+    if (!port) {
+        return res.status(400).json({ error: 'Port is required' });
+    }
+    
+    try {
+        console.log(`Attempting to connect to ESP32 on ${port}...`);
+        
+        // Test the serial connection
+        const connectionResult = await testSerialConnection(port);
+        
+        if (connectionResult.success) {
+            console.log(`Successfully connected to ESP32 on ${port}`);
+        res.json({ 
+            success: true, 
+            port: port,
+                message: 'Connected to relay for programming',
+                device_info: connectionResult.deviceInfo
+        });
+        } else {
+            throw new Error(connectionResult.error);
+        }
+    } catch (err) {
+        console.error('Error connecting to relay:', err);
+        res.status(500).json({ error: 'Failed to connect to relay', details: err.message });
+    }
+});
+
+// Test serial connection to ESP32
+async function testSerialConnection(port) {
+    return new Promise((resolve) => {
+        try {
+            console.log(`Testing connection to ${port}...`);
+            
+            const serialPort = new SerialPort({
+                path: port,
+                baudRate: 115200,
+                autoOpen: false
+            });
+            
+            serialPort.open((err) => {
+                if (err) {
+                    console.error('Error opening serial port:', err);
+                    resolve({ success: false, error: `Failed to open port ${port}: ${err.message}` });
+                    return;
+                }
+                
+                console.log(`Serial connection test established on ${port}`);
+                
+                // Just test if we can open the port - don't require ping response
+                // The ESP32 firmware may not have ping/pong functionality
+                serialPort.close();
+                console.log('Port connection test successful');
+                resolve({ 
+                    success: true, 
+                    deviceInfo: {
+                        port: port,
+                        status: 'connected',
+                        message: 'Port opened successfully'
+                    }
+                });
+            });
+            
+        } catch (error) {
+            console.error('Error in testSerialConnection:', error);
+            resolve({ success: false, error: error.message });
+        }
+    });
+}
+
+// Program relay with configuration
+app.post('/api/relay-programming/program', authenticateToken, async (req, res) => {
+    const { port, configId } = req.body;
+    
+    if (!port || !configId) {
+        return res.status(400).json({ error: 'Port and configuration ID are required' });
+    }
+    
+    try {
+        console.log(`Programming relay on port ${port} with config ID ${configId}`);
+        
+        // Get configuration details
+        const configResult = await db.query('SELECT * FROM relay_configurations WHERE id = $1', [configId]);
+        if (configResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Configuration not found' });
+        }
+        
+        const config = configResult.rows[0];
+        console.log('Configuration found:', config.relay_name);
+        
+        // Step 1: Upload configured firmware to ESP32
+        console.log('🚀 Step 1: Uploading configured firmware to ESP32...');
+        const uploadResult = await uploadFirmwareToESP32(port, config);
+        
+        if (!uploadResult.success) {
+            return res.status(500).json({ 
+                success: false,
+                error: 'Firmware upload failed',
+                details: uploadResult.error
+            });
+        }
+        
+        console.log('✅ Configured firmware upload completed successfully');
+        console.log('🎉 PROGRAMMING COMPLETED SUCCESSFULLY!');
+        console.log('📋 SUMMARY:');
+        console.log(`   - Device: ${config.relay_name}`);
+        console.log(`   - WiFi: ${config.ssid}`);
+        console.log(`   - Server: skytechautomated.com:40000`);
+        console.log(`   - Device will connect automatically after reset`);
+        
+        res.json({
+            success: true,
+            details: {
+                device_id: config.relay_id,
+                device_name: config.relay_name,
+                server_host: "skytechautomated.com",
+                server_port: 40000,
+                message: 'Configured firmware uploaded successfully. Device will connect automatically after reset.'
+            }
+        });
+        
+    } catch (err) {
+        console.error('Error programming relay:', err);
+        res.status(500).json({ error: 'Failed to program relay', details: err.message });
+    }
+});
+
+// Upload firmware to ESP32 using PlatformIO
+async function uploadFirmwareToESP32(port, config = null) {
+    return new Promise((resolve) => {
+        const { spawn } = require('child_process');
+        const path = require('path');
+        const fs = require('fs');
+        
+        console.log(`📡 Uploading firmware to ${port}...`);
+        
+        // Path to the ESP32 firmware directory
+        const firmwareDir = path.join(__dirname, '..', 'esp32');
+        const firmwareFile = 'src/main.cpp';
+        const firmwarePath = path.join(firmwareDir, firmwareFile);
+        
+        // Check if firmware file exists
+        if (!fs.existsSync(firmwarePath)) {
+            resolve({ 
+                success: false, 
+                error: `Firmware file not found: ${firmwareFile}`,
+                details: 'Make sure the firmware file exists in the esp32 directory'
+            });
+            return;
+        }
+        
+        console.log(`📁 Firmware file: ${firmwarePath}`);
+        
+        // If configuration is provided, modify the firmware file directly
+        let originalContent = null;
+        if (config) {
+            console.log(`⚙️  Configuring firmware with device settings...`);
+            
+            // Backup original content
+            originalContent = fs.readFileSync(firmwarePath, 'utf8');
+            
+            // Read the firmware
+            let firmwareContent = originalContent;
+            
+            // Replace the default configuration with the provided config
+            const defaultConfig = `DeviceConfig config = {
+    CONFIG_MAGIC,
+    CONFIG_VERSION,
+    "unconfigured",
+    "Unconfigured Relay",
+    "",
+    "",
+    "skytechautomated.com",
+    40000,
+    false
+};`;
+            
+            const configuredConfig = `DeviceConfig config = {
+    CONFIG_MAGIC,
+    CONFIG_VERSION,
+    "${config.relay_id}",
+    "${config.relay_name}",
+    "${config.ssid}",
+    "${config.password}",
+    "skytechautomated.com",
+    40000,
+    true
+};`;
+            
+            console.log(`🔍 Default config pattern to replace:`);
+            console.log(defaultConfig);
+            console.log(`🔍 Configured config to insert:`);
+            console.log(configuredConfig);
+            
+            // Replace the configuration
+            firmwareContent = firmwareContent.replace(defaultConfig, configuredConfig);
+            
+            // Debug: Check if replacement worked
+            if (firmwareContent.includes(config.ssid)) {
+                console.log(`✅ Configuration replacement successful - found SSID: ${config.ssid}`);
+            } else {
+                console.log(`❌ Configuration replacement failed - SSID not found in firmware`);
+                console.log(`🔍 Looking for default config pattern...`);
+                if (firmwareContent.includes('"unconfigured"')) {
+                    console.log(`⚠️  Found "unconfigured" - replacement may have failed`);
+                }
+            }
+            
+            // Debug: Check if password replacement worked
+            if (firmwareContent.includes(config.password)) {
+                console.log(`✅ Configuration replacement successful - found password: ${config.password}`);
+            } else {
+                console.log(`❌ Configuration replacement failed - password not found in firmware`);
+                console.log(`🔍 Password length: ${config.password.length}`);
+                console.log(`🔍 Password value: "${config.password}"`);
+            }
+            
+            // Write the configured firmware back to the original file
+            fs.writeFileSync(firmwarePath, firmwareContent);
+            
+            console.log(`✅ Modified firmware with configuration:`);
+            console.log(`   Device ID: ${config.relay_id}`);
+            console.log(`   Device Name: ${config.relay_name}`);
+            console.log(`   WiFi SSID: ${config.ssid}`);
+            console.log(`   WiFi Password: ${config.password}`);
+            console.log(`   Server: skytechautomated.com:40000`);
+        }
+        
+        // Use PlatformIO to upload firmware
+        const uploadCommand = `pio run --target upload --environment esp32dev --upload-port ${port}`;
+        
+        console.log(`🔧 Executing: ${uploadCommand}`);
+        
+        const pio = spawn('pio', [
+            'run', 
+            '--target', 'upload', 
+            '--environment', 'esp32dev', 
+            '--upload-port', port
+        ], {
+            cwd: firmwareDir,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        
+        let output = '';
+        let errorOutput = '';
+        
+        pio.stdout.on('data', (data) => {
+            const text = data.toString();
+            output += text;
+            console.log(`📤 ${text.trim()}`);
+        });
+        
+        pio.stderr.on('data', (data) => {
+            const text = data.toString();
+            errorOutput += text;
+            console.log(`⚠️  ${text.trim()}`);
+        });
+        
+        pio.on('close', (code) => {
+            // Restore original firmware content if it was modified
+            if (originalContent) {
+                fs.writeFileSync(firmwarePath, originalContent);
+                console.log('🔄 Restored original firmware file');
+            }
+            
+            if (code === 0) {
+                console.log('✅ Firmware upload completed successfully!');
+                resolve({ 
+                    success: true, 
+                    details: {
+                        output: output,
+                        port: port,
+                        firmware: firmwareFile,
+                        configured: config ? true : false
+                    }
+                });
+            } else {
+                console.log(`❌ Firmware upload failed with code ${code}`);
+                resolve({ 
+                    success: false, 
+                    error: `Firmware upload failed with code ${code}`,
+                    details: {
+                        error_output: errorOutput,
+                        output: output,
+                        port: port,
+                        firmware: firmwareFile
+                    }
+                });
+            }
+        });
+        
+        pio.on('error', (err) => {
+            // Restore original firmware content if it was modified
+            if (originalContent) {
+                fs.writeFileSync(firmwarePath, originalContent);
+                console.log('🔄 Restored original firmware file');
+            }
+            
+            console.error(`❌ PlatformIO error: ${err.message}`);
+            resolve({ 
+                success: false, 
+                error: `PlatformIO error: ${err.message}`,
+                details: 'Make sure PlatformIO is installed and accessible'
+            });
+        });
+    });
+}
+
+// Disconnect from relay
+app.post('/api/relay-programming/disconnect', authenticateToken, async (req, res) => {
+    try {
+        // This would typically close the serial connection
+        res.json({ 
+            success: true, 
+            message: 'Disconnected from relay'
+        });
+    } catch (err) {
+        console.error('Error disconnecting from relay:', err);
+        res.status(500).json({ error: 'Failed to disconnect from relay' });
+    }
+});
+
+// === Relay Assignment Endpoints ===
+
+// Get all relay assignments
+app.get('/api/relay-assignments', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT ra.*, t.name as template_name
+            FROM relay_assignments ra
+            LEFT JOIN templates t ON ra.template_id = t.id
+            ORDER BY ra.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching relay assignments:', err);
+        res.status(500).json({ error: 'Failed to fetch relay assignments' });
+    }
+});
+
+// Create relay assignment
+app.post('/api/relay-assignments', authenticateToken, async (req, res) => {
+    const { connected_relay_id, template_id, assignment_type } = req.body;
+    
+    if (!connected_relay_id || !template_id || !assignment_type) {
+        return res.status(400).json({ error: 'Connected relay ID, template ID, and assignment type are required' });
+    }
+    
+    try {
+        // Check if assignment already exists
+        const existingResult = await db.query(
+            'SELECT * FROM relay_assignments WHERE connected_relay_id = $1 AND template_id = $2',
+            [connected_relay_id, template_id]
+        );
+        if (existingResult.rows.length > 0) {
+            return res.status(409).json({ error: 'Assignment already exists' });
+        }
+        
+        // Create assignment
+        const result = await db.query(`
+            INSERT INTO relay_assignments (connected_relay_id, template_id, assignment_type)
+            VALUES ($1, $2, $3)
+            RETURNING *
+        `, [connected_relay_id, template_id, assignment_type]);
+        
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error creating relay assignment:', err);
+        res.status(500).json({ error: 'Failed to create relay assignment' });
+    }
+});
+
+// Delete relay assignment
+app.delete('/api/relay-assignments/:relayId', authenticateToken, async (req, res) => {
+    const { relayId } = req.params;
+    
+    try {
+        const result = await db.query(
+            'DELETE FROM relay_assignments WHERE connected_relay_id = $1',
+            [relayId]
+        );
+        
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Assignment not found' });
+        }
+        
+        res.status(204).send();
+    } catch (err) {
+        console.error('Error deleting relay assignment:', err);
+        res.status(500).json({ error: 'Failed to delete relay assignment' });
+    }
+});
+
+// Get a specific relay by MAC address
+app.get('/api/relays/:mac', authenticateToken, async (req, res) => {
+    const { mac } = req.params;
+    try {
+        const result = await db.query(`
+            SELECT r.*, t.name as template_name, t.id as template_id
+            FROM relays r
+            LEFT JOIN templates t ON r.template_id = t.id
+            WHERE r.mac_address = $1
+        `, [mac]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Relay not found' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error fetching relay:', err);
+        res.status(500).json({ error: 'Failed to fetch relay' });
+    }
+});
+
+// Register a new relay
+app.post('/api/relays', authenticateToken, async (req, res) => {
+    const { mac_address, name, location, description, template_id } = req.body;
+    
+    if (!mac_address || !name) {
+        return res.status(400).json({ error: 'MAC address and name are required' });
+    }
+    
+    try {
+        // Check if relay already exists
+        const existingResult = await db.query('SELECT * FROM relays WHERE mac_address = $1', [mac_address]);
+        if (existingResult.rows.length > 0) {
+            return res.status(409).json({ error: 'Relay with this MAC address already exists' });
+        }
+        
+        // Insert new relay
+        const result = await db.query(`
+            INSERT INTO relays (mac_address, name, location, description, template_id, status)
+            VALUES ($1, $2, $3, $4, $5, 'offline')
+            RETURNING *
+        `, [mac_address, name, location || null, description || null, template_id || null]);
+        
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error creating relay:', err);
+        res.status(500).json({ error: 'Failed to create relay' });
+    }
+});
+
+// Update relay information
+app.put('/api/relays/:mac', authenticateToken, async (req, res) => {
+    const { mac } = req.params;
+    const { name, location, description, template_id } = req.body;
+    
+    try {
+        const result = await db.query(`
+            UPDATE relays 
+            SET name = COALESCE($1, name),
+                location = COALESCE($2, location),
+                description = COALESCE($3, description),
+                template_id = COALESCE($4, template_id),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE mac_address = $5
+            RETURNING *
+        `, [name, location, description, template_id, mac]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Relay not found' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error updating relay:', err);
+        res.status(500).json({ error: 'Failed to update relay' });
+    }
+});
+
+// Delete a relay
+app.delete('/api/relays/:mac', authenticateToken, async (req, res) => {
+    const { mac } = req.params;
+    
+    try {
+        const result = await db.query('DELETE FROM relays WHERE mac_address = $1', [mac]);
+        
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Relay not found' });
+        }
+        
+        res.status(204).send();
+    } catch (err) {
+        console.error('Error deleting relay:', err);
+        res.status(500).json({ error: 'Failed to delete relay' });
+    }
+});
+
+// Get available templates for relay assignment
+app.get('/api/templates/available', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query('SELECT id, name, color FROM templates ORDER BY name');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching templates:', err);
+        res.status(500).json({ error: 'Failed to fetch templates' });
+    }
+});
+
+// Assign relay to template
+app.post('/api/relays/:mac/assign', authenticateToken, async (req, res) => {
+    const { mac } = req.params;
+    const { template_id } = req.body;
+    
+    if (!template_id) {
+        return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    try {
+        // Verify template exists
+        const templateResult = await db.query('SELECT * FROM templates WHERE id = $1', [template_id]);
+        if (templateResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Template not found' });
+        }
+        
+        // Update relay assignment
+        const result = await db.query(`
+            UPDATE relays 
+            SET template_id = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE mac_address = $2
+            RETURNING *
+        `, [template_id, mac]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Relay not found' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error assigning relay:', err);
+        res.status(500).json({ error: 'Failed to assign relay' });
+    }
+});
+
+// Remove relay from template
+app.delete('/api/relays/:mac/assign', authenticateToken, async (req, res) => {
+    const { mac } = req.params;
+    
+    try {
+        const result = await db.query(`
+            UPDATE relays 
+            SET template_id = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE mac_address = $1
+            RETURNING *
+        `, [mac]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Relay not found' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error removing relay assignment:', err);
+        res.status(500).json({ error: 'Failed to remove relay assignment' });
+    }
+});
+
+// Get relays by template
+app.get('/api/templates/:id/relays', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const result = await db.query(`
+            SELECT r.*, 
+                   CASE WHEN cr.mac_address IS NOT NULL THEN 'connected' ELSE 'disconnected' END as connection_status
+            FROM relays r
+            LEFT JOIN (
+                SELECT DISTINCT mac_address 
+                FROM jsonb_array_elements_text($1::jsonb) as mac_address
+            ) cr ON r.mac_address = cr.mac_address
+            WHERE r.template_id = $2
+            ORDER BY r.name
+        `, [JSON.stringify(Array.from(connectedRelays.keys())), id]);
+        
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching template relays:', err);
+        res.status(500).json({ error: 'Failed to fetch template relays' });
+    }
+});
+
+// === Elevator Control Endpoints ===
+
+// Store elevator states
+const elevatorStates = new Map();
+
+// Receive elevator state from ESP32
+app.post('/api/elevator/state', async (req, res) => {
+    try {
+        const { device_id, elevator_in_use, target_floor, door_open_requested, door_close_requested, inputs, relays } = req.body;
+        
+        // Store elevator state
+        elevatorStates.set(device_id, {
+            device_id,
+            elevator_in_use,
+            target_floor,
+            door_open_requested,
+            door_close_requested,
+            inputs,
+            relays,
+            last_update: new Date().toISOString()
+        });
+        
+        // Broadcast to connected WebSocket clients
+        broadcastToClients({
+            type: 'elevator_state_update',
+            device_id,
+            state: elevatorStates.get(device_id)
+        });
+        
+        res.status(200).json({ status: 'received' });
+    } catch (err) {
+        console.error('Error receiving elevator state:', err);
+        res.status(500).json({ error: 'Failed to process elevator state' });
+    }
+});
+
+// Get elevator state
+app.get('/api/elevator/state/:device_id', authenticateToken, async (req, res) => {
+    const { device_id } = req.params;
+    
+    try {
+        const state = elevatorStates.get(device_id);
+        if (!state) {
+            return res.status(404).json({ error: 'Elevator state not found' });
+        }
+        
+        res.json(state);
+    } catch (err) {
+        console.error('Error fetching elevator state:', err);
+        res.status(500).json({ error: 'Failed to fetch elevator state' });
+    }
+});
+
+// Get all elevator states
+app.get('/api/elevator/states', authenticateToken, async (req, res) => {
+    try {
+        const states = Array.from(elevatorStates.values());
+        res.json(states);
+    } catch (err) {
+        console.error('Error fetching elevator states:', err);
+        res.status(500).json({ error: 'Failed to fetch elevator states' });
+    }
+});
+
+// Send elevator command to ESP32
+app.post('/api/elevator/command', authenticateToken, async (req, res) => {
+    const { device_id, command, floor } = req.body;
+    
+    if (!device_id || !command) {
+        return res.status(400).json({ error: 'Device ID and command are required' });
+    }
+    
+    try {
+        // Find connected relay by device_id (MAC address)
+        const relay = connectedRelays.get(device_id);
+        if (!relay) {
+            return res.status(404).json({ error: 'Elevator device not connected' });
+        }
+        
+        // Send command via WebSocket
+        const message = {
+            type: 'elevator_command',
+            command,
+            floor: floor || null
+        };
+        
+        relay.send(JSON.stringify(message));
+        
+        res.json({ status: 'command_sent', command, floor });
+    } catch (err) {
+        console.error('Error sending elevator command:', err);
+        res.status(500).json({ error: 'Failed to send elevator command' });
+    }
+});
+
+// Get elevator I/O configuration
+app.get('/api/elevator/config/:device_id', authenticateToken, async (req, res) => {
+    const { device_id } = req.params;
+    
+    try {
+        // For now, return default configuration
+        // TODO: Load from database
+        const config = {
+            device_id,
+            io_mappings: [
+                { relay_pin: 16, input_pin: 0, function: "door_open", enabled: true, safety_required: true },
+                { relay_pin: 17, input_pin: 1, function: "door_close", enabled: true, safety_required: true },
+                { relay_pin: 18, input_pin: 2, function: "floor_1", enabled: true, safety_required: true },
+                { relay_pin: 19, input_pin: 3, function: "floor_2", enabled: true, safety_required: true },
+                { relay_pin: 21, input_pin: 4, function: "floor_3", enabled: true, safety_required: true },
+                { relay_pin: 22, input_pin: 5, function: "floor_4", enabled: true, safety_required: true },
+                { relay_pin: 23, input_pin: 6, function: "floor_5", enabled: true, safety_required: true },
+                { relay_pin: 25, input_pin: 7, function: "floor_6", enabled: true, safety_required: true }
+            ],
+            safety_settings: {
+                require_floor_confirmation: true,
+                auto_release_on_violation: true,
+                max_door_open_time: 30000, // 30 seconds
+                safety_check_interval: 100 // 100ms
+            }
+        };
+        
+        res.json(config);
+    } catch (err) {
+        console.error('Error fetching elevator config:', err);
+        res.status(500).json({ error: 'Failed to fetch elevator config' });
+    }
+});
+
+// Update elevator I/O configuration
+app.put('/api/elevator/config/:device_id', authenticateToken, async (req, res) => {
+    const { device_id } = req.params;
+    const { io_mappings, safety_settings } = req.body;
+    
+    try {
+        // TODO: Save to database
+        // For now, just return success
+        res.json({ 
+            status: 'updated',
+            device_id,
+            io_mappings,
+            safety_settings
+        });
+    } catch (err) {
+        console.error('Error updating elevator config:', err);
+        res.status(500).json({ error: 'Failed to update elevator config' });
+    }
+});
+
+// Get elevator safety logs
+app.get('/api/elevator/logs/:device_id', authenticateToken, async (req, res) => {
+    const { device_id } = req.params;
+    const { limit = 100 } = req.query;
+    
+    try {
+        // TODO: Load from database
+        // For now, return empty array
+        res.json([]);
+    } catch (err) {
+        console.error('Error fetching elevator logs:', err);
+        res.status(500).json({ error: 'Failed to fetch elevator logs' });
+    }
+});
+
+
+
+
+
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
 }); 
+
+// Start relay server on port 40000 for elevator relays
+relayServer.listen(40000, '0.0.0.0', () => {
+    console.log(`Relay server running on port 40000`);
+});
+
+// Generate firmware configuration from relay config
+function generateFirmwareConfig(config) {
+    // Simplified configuration for clean ESP32 firmware
+    const firmwareConfig = {
+        device_id: config.relay_id,
+        device_name: config.relay_name,
+        wifi_ssid: config.ssid,
+        wifi_password: config.password,
+        server_host: "skytechautomated.com",
+        server_port: 40000
+    };
+
+    // Add MAC address if configured
+    if (config.mac_address) {
+        firmwareConfig.mac_address = config.mac_address;
+    }
+
+    return firmwareConfig;
+}
+
+// Program ESP32 device via serial connection
+async function programESP32Device(port, firmwareConfig, config) {
+    return new Promise(async (resolve) => {
+        let serialPort = null;
+        let responseTimeout = null;
+        
+        try {
+            console.log(`\n=== STARTING ESP32 PROGRAMMING ===`);
+            console.log(`📡 Port: ${port}`);
+            console.log(`🏷️  Device: ${config.relay_name} (${config.relay_id})`);
+            console.log(`📶 WiFi: ${config.ssid}`);
+            console.log(`🌐 Server: ${firmwareConfig.server_host}:${firmwareConfig.server_port}`);
+            console.log(`🔧 Device ID: ${firmwareConfig.device_id}`);
+            console.log(`📥 Device Name: ${firmwareConfig.device_name}`);
+            
+            // Create serial connection
+            serialPort = new SerialPort({
+                path: port,
+                baudRate: 115200,
+                autoOpen: false
+            });
+            
+            // Handle serial port errors
+            serialPort.on('error', (err) => {
+                console.error(`❌ SERIAL PORT ERROR: ${err.message}`);
+                if (responseTimeout) clearTimeout(responseTimeout);
+                if (serialPort && serialPort.isOpen) {
+                    serialPort.close((closeErr) => {
+                        if (closeErr) console.error(`Error closing port: ${closeErr.message}`);
+                    });
+                }
+                resolve({ 
+                    success: false, 
+                    error: `Serial port error: ${err.message}`,
+                    details: 'Device may have been disconnected or reset'
+                });
+            });
+            
+            serialPort.open((err) => {
+                if (err) {
+                    console.error(`❌ FAILED: Could not open port ${port}: ${err.message}`);
+                    console.log(`💡 TIP: Make sure the device is connected and the port is available`);
+                    resolve({ success: false, error: `Failed to open port ${port}: ${err.message}` });
+                    return;
+                }
+                
+                console.log(`✅ SUCCESS: Serial connection established on ${port}`);
+                
+                // Send configuration to device
+                const configMessage = JSON.stringify({
+                    type: 'config',
+                    data: firmwareConfig
+                });
+                
+                console.log(`📤 SENDING CONFIGURATION TO DEVICE:`);
+                console.log(configMessage);
+                console.log(`⏳ Waiting 35 seconds for ESP32 to boot and be ready...`);
+                
+                // Wait for ESP32 to boot and be ready (35 seconds)
+                setTimeout(() => {
+                    serialPort.write(configMessage + '\n', (err) => {
+                        if (err) {
+                            console.error(`❌ FAILED: Could not write to device: ${err.message}`);
+                            console.log(`💡 TIP: Check if device is in programming mode`);
+                            if (serialPort && serialPort.isOpen) {
+                                serialPort.close((closeErr) => {
+                                    if (closeErr) console.error(`Error closing port: ${closeErr.message}`);
+                                });
+                            }
+                            resolve({ success: false, error: `Failed to write to device: ${err.message}` });
+                            return;
+                        }
+                        
+                        console.log(`✅ SUCCESS: Configuration sent to device`);
+                        console.log(`🎉 PROGRAMMING COMPLETED SUCCESSFULLY!`);
+                        console.log(`📋 SUMMARY:`);
+                        console.log(`   - Device: ${config.relay_name}`);
+                        console.log(`   - WiFi: ${config.ssid}`);
+                        console.log(`   - Server: ${firmwareConfig.server_host}:${firmwareConfig.server_port}`);
+                        console.log(`   - Device will connect automatically`);
+                        console.log(`=== PROGRAMMING COMPLETE ===\n`);
+                        
+                        // Close serial port
+                        if (serialPort && serialPort.isOpen) {
+                            serialPort.close((closeErr) => {
+                                if (closeErr) console.error(`Error closing port: ${closeErr.message}`);
+                            });
+                        }
+                        
+                        resolve({ 
+                            success: true,
+                            details: {
+                                device_id: firmwareConfig.device_id,
+                                device_name: firmwareConfig.device_name,
+                                server_host: firmwareConfig.server_host,
+                                server_port: firmwareConfig.server_port,
+                                message: 'Configuration sent successfully. Device will connect automatically.'
+                            }
+                        });
+                    });
+                }, 35000); // 35 seconds
+            });
+            
+        } catch (error) {
+            console.error(`❌ CRITICAL ERROR: ${error.message}`);
+            if (responseTimeout) clearTimeout(responseTimeout);
+            if (serialPort && serialPort.isOpen) {
+                serialPort.close((closeErr) => {
+                    if (closeErr) console.error(`Error closing port: ${closeErr.message}`);
+                });
+            }
+            resolve({ success: false, error: error.message });
+        }
+    });
+}
+
+// API endpoint to get unassigned relays from connected_relays table that can be assigned to templates
+app.get('/api/connected-relays/assignable', authenticateToken, async (req, res) => {
+    try {
+        // Get only unassigned relays from the connected_relays table
+                const dbResult = await db.query(`
+            SELECT 
+                cr.id,
+                cr.mac_address,
+                cr.name,
+                cr.status,
+                cr.is_connected,
+                cr.last_seen,
+                cr.device_name,
+                cr.device_id,
+                cr.ip_address,
+                cr.port,
+                cr.location,
+                cr.description,
+                rc.relay_name as config_name,
+                CASE 
+                    WHEN cr.is_connected = TRUE THEN 'online'
+                    ELSE 'offline'
+                END as connection_status
+                    FROM connected_relays cr
+            LEFT JOIN relay_configurations rc ON cr.relay_configuration_id = rc.id
+            WHERE cr.id NOT IN (
+                SELECT DISTINCT connected_relay_id 
+                FROM relay_assignments 
+                WHERE connected_relay_id IS NOT NULL
+            )
+            ORDER BY cr.name, cr.mac_address
+        `);
+        
+        const connectedRelaysList = [];
+        
+        for (const dbRelay of dbResult.rows) {
+            // Since these are unassigned relays, they won't have any assignments
+            connectedRelaysList.push({
+                mac: dbRelay.mac_address,
+                ip: dbRelay.ip_address,
+                port: dbRelay.port || 81,
+                status: dbRelay.connection_status,
+                last_seen: dbRelay.last_seen,
+                name: dbRelay.name || dbRelay.device_name || `Relay-${dbRelay.mac_address.substring(-6)}`,
+                location: dbRelay.location,
+                description: dbRelay.description,
+                config_name: dbRelay.config_name,
+                capabilities: [], // removed rc.capabilities, set to empty array for compatibility
+                assignments: [], // Unassigned relays have no assignments
+                db_id: dbRelay.id
+            });
+        }
+        
+        res.json({
+            count: connectedRelaysList.length,
+            relays: connectedRelaysList
+        });
+    } catch (err) {
+        console.error('Error fetching assignable relays:', err);
+        res.status(500).json({ error: 'Failed to fetch assignable relays' });
+    }
+});
+
+// Create relay assignment by MAC address
+app.post('/api/relay-assignments/by-mac', authenticateToken, async (req, res) => {
+    const { mac_address, template_id, assignment_type } = req.body;
+    
+    if (!mac_address || !template_id || !assignment_type) {
+        return res.status(400).json({ error: 'MAC address, template ID, and assignment type are required' });
+    }
+    
+    try {
+        // Get connected_relay record from database
+        const existingRelayResult = await db.query(
+            'SELECT id FROM connected_relays WHERE mac_address = $1',
+            [mac_address]
+        );
+        
+        if (existingRelayResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Relay not found in database. Please register the relay first.' });
+        }
+        
+        const connectedRelayId = existingRelayResult.rows[0].id;
+        
+        // Check if assignment already exists
+        const existingAssignmentResult = await db.query(
+            'SELECT * FROM relay_assignments WHERE connected_relay_id = $1 AND template_id = $2',
+            [connectedRelayId, template_id]
+        );
+        if (existingAssignmentResult.rows.length > 0) {
+            return res.status(409).json({ error: 'Assignment already exists' });
+        }
+        
+        // Create assignment
+        const result = await db.query(`
+            INSERT INTO relay_assignments (connected_relay_id, template_id, assignment_type)
+            VALUES ($1, $2, $3)
+            RETURNING *
+        `, [connectedRelayId, template_id, assignment_type]);
+        
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error creating relay assignment:', err);
+        res.status(500).json({ error: 'Failed to create relay assignment' });
+    }
+});
+
+// Remove relay assignment by MAC address and template ID
+app.delete('/api/relay-assignments/by-mac/:mac/:templateId', authenticateToken, async (req, res) => {
+    const { mac, templateId } = req.params;
+    
+    try {
+        // Find the connected_relay record
+        const relayResult = await db.query(
+            'SELECT id FROM connected_relays WHERE mac_address = $1',
+            [mac]
+        );
+        
+        if (relayResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Connected relay not found' });
+        }
+        
+        const connectedRelayId = relayResult.rows[0].id;
+        
+        // Delete the assignment
+        const result = await db.query(
+            'DELETE FROM relay_assignments WHERE connected_relay_id = $1 AND template_id = $2',
+            [connectedRelayId, templateId]
+        );
+        
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Assignment not found' });
+        }
+        
+        res.status(204).send();
+    } catch (err) {
+        console.error('Error removing relay assignment:', err);
+        res.status(500).json({ error: 'Failed to remove relay assignment' });
+    }
+});
+
+// API endpoint to update relay channel configuration
+app.put('/api/relays/:relayId/channel-config', authenticateToken, async (req, res) => {
+    const { relayId } = req.params;
+    const { channel_config, template_id } = req.body;
+    
+    if (!channel_config || typeof channel_config !== 'object') {
+        return res.status(400).json({ error: 'Channel configuration is required' });
+    }
+    
+    if (!template_id) {
+        return res.status(400).json({ error: 'Template ID is required' });
+    }
+    
+    try {
+        // Check if relay exists and is assigned to this template
+        const assignmentResult = await db.query(
+            'SELECT * FROM relay_assignments WHERE connected_relay_id = $1 AND template_id = $2',
+            [relayId, template_id]
+        );
+        
+        if (assignmentResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Relay assignment not found' });
+        }
+        
+        // Prepare channel data for the new table structure
+        const channelData = {};
+        for (let i = 1; i <= 8; i++) {
+            channelData[`channel_${i}`] = channel_config[i] || null;
+        }
+        
+        // Insert or update the relay settings
+        const result = await db.query(`
+            INSERT INTO relay_settings (connected_relay_id, template_id, channel_1, channel_2, channel_3, channel_4, channel_5, channel_6, channel_7, channel_8, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+            ON CONFLICT (connected_relay_id, template_id) 
+            DO UPDATE SET 
+                channel_1 = EXCLUDED.channel_1,
+                channel_2 = EXCLUDED.channel_2,
+                channel_3 = EXCLUDED.channel_3,
+                channel_4 = EXCLUDED.channel_4,
+                channel_5 = EXCLUDED.channel_5,
+                channel_6 = EXCLUDED.channel_6,
+                channel_7 = EXCLUDED.channel_7,
+                channel_8 = EXCLUDED.channel_8,
+                updated_at = CURRENT_TIMESTAMP
+        `, [
+            relayId, 
+            template_id, 
+            channelData.channel_1, 
+            channelData.channel_2, 
+            channelData.channel_3, 
+            channelData.channel_4, 
+            channelData.channel_5, 
+            channelData.channel_6, 
+            channelData.channel_7, 
+            channelData.channel_8
+        ]);
+        
+        res.json({ message: 'Channel configuration updated successfully' });
+    } catch (err) {
+        console.error('Error updating channel configuration:', err);
+        res.status(500).json({ error: 'Failed to update channel configuration' });
+    }
+});
+
+// API endpoint to get elevator status
+app.get('/api/elevator-status/:relayMac', authenticateToken, async (req, res) => {
+    const { relayMac } = req.params;
+    
+    try {
+        const result = await db.query(`
+            SELECT status_data, last_updated
+            FROM elevator_status 
+            WHERE relay_mac = $1
+        `, [relayMac]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Elevator status not found' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error fetching elevator status:', err);
+        res.status(500).json({ error: 'Failed to fetch elevator status' });
+    }
+});
+
+// API endpoint to get all elevator statuses
+app.get('/api/elevator-status', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT relay_mac, status_data, last_updated
+            FROM elevator_status 
+            ORDER BY last_updated DESC
+        `);
+        
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching elevator statuses:', err);
+        res.status(500).json({ error: 'Failed to fetch elevator statuses' });
+    }
+});
+
+// Helper function to get elevator relays for a template from database
+async function getElevatorRelaysForTemplateFromDB(templateId) {
+    try {
+        // Get all relays assigned to this template with their channel settings
+        const result = await db.query(`
+            SELECT 
+                cr.id,
+                cr.mac_address,
+                cr.name,
+                cr.ip_address,
+                cr.port,
+                rc.relay_name,
+                rs.channel_1,
+                rs.channel_2,
+                rs.channel_3,
+                rs.channel_4,
+                rs.channel_5,
+                rs.channel_6,
+                rs.channel_7,
+                rs.channel_8
+            FROM connected_relays cr
+            LEFT JOIN relay_configurations rc ON cr.relay_configuration_id = rc.id
+            INNER JOIN relay_assignments ra ON cr.id = ra.connected_relay_id
+            LEFT JOIN relay_settings rs ON cr.id = rs.connected_relay_id AND ra.template_id = rs.template_id
+            WHERE ra.template_id = $1
+            ORDER BY cr.name
+        `, [templateId]);
+        
+        // Convert the flat channel columns to a channel_config object
+        const relaysWithConfig = result.rows.map(relay => {
+            const channelConfig = {};
+            for (let i = 1; i <= 8; i++) {
+                const channelValue = relay[`channel_${i}`];
+                if (channelValue) {
+                    channelConfig[i] = channelValue;
+                }
+            }
+            
+            return {
+                ...relay,
+                channel_config: channelConfig
+            };
+        });
+        
+        return relaysWithConfig;
+    } catch (error) {
+        console.error('Error getting elevator relays for template:', error);
+        return [];
+    }
+}
+
+// Helper function to find which relay handles a specific floor
+function findRelayForFloor(relays, targetFloor) {
+    for (const relay of relays) {
+        if (relay.channel_config) {
+            for (const [channel, function_] of Object.entries(relay.channel_config)) {
+                if (function_ === `floor${targetFloor}`) {
+                    return { relay, channel, function: function_ };
+                }
+            }
+        }
+    }
+    return null;
+}
+
+// Helper function to find which relay handles a specific function
+function findRelayForFunction(relays, functionName) {
+    for (const relay of relays) {
+        if (relay.channel_config) {
+            for (const [channel, function_] of Object.entries(relay.channel_config)) {
+                if (function_ === functionName) {
+                    return { relay, channel, function: function_ };
+                }
+            }
+        }
+    }
+    return null;
+}
+
+// Process DI inputs and map them to elevator status
+async function processDIInputs(macAddress, inputs) {
+    try {
+        console.log(`[DEBUG] Processing DI inputs for relay ${macAddress}:`, inputs);
+        
+        // Get the relay's channel configuration from the database
+        const relayResult = await db.query(`
+            SELECT cr.id, cr.mac_address
+            FROM connected_relays cr
+            WHERE cr.mac_address = $1
+        `, [macAddress]);
+        
+        if (relayResult.rows.length === 0) {
+            console.log(`[DEBUG] Relay ${macAddress} not found in database`);
+            return;
+        }
+        
+        const relayId = relayResult.rows[0].id;
+        
+        // Get all relay settings for this relay across all templates
+        const settingsResult = await db.query(`
+            SELECT rs.*, t.name as template_name
+            FROM relay_settings rs
+            JOIN templates t ON rs.template_id = t.id
+            WHERE rs.connected_relay_id = $1
+        `, [relayId]);
+        
+        if (settingsResult.rows.length === 0) {
+            console.log(`[DEBUG] No channel settings found for relay ${macAddress}`);
+            return;
+        }
+        
+        // Process each DI input and update elevator status
+        const elevatorStatus = {
+            door_open: false,
+            door_close: false,
+            basementodt: false,
+            current_floor: null,
+            last_updated: new Date().toISOString()
+        };
+        
+        for (let diIndex = 0; diIndex < inputs.length; diIndex++) {
+            const diValue = inputs[diIndex];
+            const diNumber = diIndex + 1; // DI numbers are 1-based
+            
+            console.log(`[DEBUG] DI ${diNumber} = ${diValue}`);
+            
+            // Skip if DI is not active (assuming 1 = active, 0 = inactive)
+            if (diValue !== 1) {
+                continue;
+            }
+            
+            // Find which channel function corresponds to this DI
+            let channelFunction = null;
+            for (const setting of settingsResult.rows) {
+                // Check if this DI corresponds to a channel
+                const channelValue = setting[`channel_${diNumber}`];
+                if (channelValue && channelValue !== 'hall_call') { // Skip hall call as it's output only
+                    channelFunction = channelValue;
+                    console.log(`[DEBUG] DI ${diNumber} maps to status: ${channelFunction} (Template: ${setting.template_name})`);
+                    break;
+                }
+            }
+            
+            if (channelFunction) {
+                // Update elevator status based on the DI input
+                await updateElevatorStatus(macAddress, channelFunction, true);
+            }
+        }
+        
+        // Also update status for inactive DIs (set to false)
+        for (let diIndex = 0; diIndex < inputs.length; diIndex++) {
+            const diValue = inputs[diIndex];
+            const diNumber = diIndex + 1;
+            
+            if (diValue === 0) {
+                // Find which channel function corresponds to this DI
+                let channelFunction = null;
+                for (const setting of settingsResult.rows) {
+                    const channelValue = setting[`channel_${diNumber}`];
+                    if (channelValue && channelValue !== 'hall_call') {
+                        channelFunction = channelValue;
+                        break;
+                    }
+                }
+                
+                if (channelFunction) {
+                    // Update elevator status based on the DI input
+                    await updateElevatorStatus(macAddress, channelFunction, false);
+                }
+            }
+        }
+        
+    } catch (error) {
+        console.error(`[ERROR] Error processing DI inputs for relay ${macAddress}:`, error);
+    }
+}
+
+// Update elevator status based on DI inputs
+async function updateElevatorStatus(macAddress, functionName, isActive) {
+    console.log(`[INFO] Elevator status update - ${macAddress}: ${functionName} = ${isActive}`);
+    
+    try {
+        // Get or create elevator status record
+        const statusResult = await db.query(`
+            SELECT * FROM elevator_status WHERE relay_mac = $1
+        `, [macAddress]);
+        
+        let statusData = {};
+        if (statusResult.rows.length > 0) {
+            statusData = statusResult.rows[0].status_data || {};
+        }
+        
+        // Update status based on function type
+        switch (functionName) {
+            case 'door_open':
+                statusData.door_open = isActive;
+                break;
+            case 'door_close':
+                statusData.door_close = isActive;
+                break;
+            case 'basementodt':
+                statusData.basementodt = isActive;
+                break;
+            default:
+                // Handle floor status (floor1, floor2, etc.)
+                if (functionName.startsWith('floor')) {
+                    const floorNumber = parseInt(functionName.replace('floor', ''));
+                    if (isActive) {
+                        statusData.current_floor = floorNumber;
+                    } else if (statusData.current_floor === floorNumber) {
+                        // Only clear if this was the current floor
+                        statusData.current_floor = null;
+                    }
+                } else {
+                    console.log(`[DEBUG] Unknown status function: ${functionName}`);
+                    return;
+                }
+        }
+        
+        statusData.last_updated = new Date().toISOString();
+        
+        // Insert or update elevator status
+        await db.query(`
+            INSERT INTO elevator_status (relay_mac, status_data, last_updated)
+            VALUES ($1, $2, CURRENT_TIMESTAMP)
+            ON CONFLICT (relay_mac) DO UPDATE
+            SET status_data = $2, last_updated = CURRENT_TIMESTAMP
+        `, [macAddress, JSON.stringify(statusData)]);
+        
+        console.log(`[INFO] Updated elevator status for ${macAddress}:`, statusData);
+        
+    } catch (error) {
+        console.error(`[ERROR] Error updating elevator status:`, error);
+    }
+}
+
+// Send relay command to ESP32
+async function sendRelayCommand(macAddress, functionName, state) {
+    try {
+        // Find which channel corresponds to this function
+        const relayResult = await db.query(`
+            SELECT cr.id
+            FROM connected_relays cr
+            WHERE cr.mac_address = $1
+        `, [macAddress]);
+        
+        if (relayResult.rows.length === 0) {
+            console.log(`[ERROR] Relay ${macAddress} not found`);
+            return;
+        }
+        
+        const relayId = relayResult.rows[0].id;
+        
+        // Get the channel number for this function
+        const settingsResult = await db.query(`
+            SELECT channel_1, channel_2, channel_3, channel_4, channel_5, channel_6, channel_7, channel_8
+            FROM relay_settings
+            WHERE connected_relay_id = $1
+        `, [relayId]);
+        
+        if (settingsResult.rows.length === 0) {
+            console.log(`[ERROR] No settings found for relay ${macAddress}`);
+            return;
+        }
+        
+        const settings = settingsResult.rows[0];
+        let channelNumber = null;
+        
+        // Find which channel has this function
+        for (let i = 1; i <= 8; i++) {
+            if (settings[`channel_${i}`] === functionName) {
+                channelNumber = i;
+                break;
+            }
+        }
+        
+        if (channelNumber === null) {
+            console.log(`[ERROR] Function ${functionName} not found in relay ${macAddress} configuration`);
+            return;
+        }
+        
+        // Send the command to the ESP32
+        const relayData = connectedRelays.get(macAddress);
+        if (relayData && relayData.ws.readyState === WebSocket.OPEN) {
+            const message = {
+                type: 'relay_control',
+                relay: channelNumber - 1, // ESP32 uses 0-based indexing
+                state: state ? 1 : 0
+            };
+            
+            relayData.ws.send(JSON.stringify(message));
+            console.log(`[INFO] Sent command to relay ${macAddress}:`, message);
+        } else {
+            console.log(`[ERROR] Relay ${macAddress} not connected`);
+        }
+        
+    } catch (error) {
+        console.error(`[ERROR] Error sending relay command:`, error);
+    }
+}
+
+// Relay WebSocket connection handling (Port 40000 - Elevator Relays Only)
+relayWss.on('connection', async (ws, req) => {
+    console.log(`[DEBUG] Relay connection attempt from ${req.socket.remoteAddress}`);
+    console.log(`[DEBUG] Request URL: ${req.url}`);
+    console.log(`[DEBUG] Request headers:`, req.headers);
+    
+    // Extract MAC address from the connection URL to identify relays
+    let macAddress = null;
+    try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+        macAddress = url.searchParams.get('id');
+        console.log(`[DEBUG] Parsed MAC address: ${macAddress}`);
+    } catch (error) {
+        console.error(`[DEBUG] Error parsing URL: ${error.message}`);
+    }
+
+    if (macAddress) {
+        // --- This is a Relay Connection on Port 80 ---
+        // Extract IP address from the connection
+        const relayIP = req.socket.remoteAddress || req.connection.remoteAddress || 'unknown';
+        
+        console.log(`[PORT 40000] Relay connected with ID: ${macAddress} from IP: ${relayIP}`);
+        
+        // Store the relay connection
+        connectedRelays.set(macAddress, { ws, ip: relayIP });
+        
+        // Insert or update connected_relays table
+        try {
+            console.log('[DEBUG] [PORT 40000] Attempting to insert/update connected_relays for', macAddress, relayIP);
+            const result = await db.query(`
+                INSERT INTO connected_relays (mac_address, status, is_connected, last_seen, ip_address, port)
+                VALUES ($1, 'online', TRUE, CURRENT_TIMESTAMP, $2, 40000)
+                ON CONFLICT (mac_address) DO UPDATE
+                SET status = 'online', is_connected = TRUE, last_seen = CURRENT_TIMESTAMP, ip_address = $2, port = 40000
+                `, [macAddress, relayIP]);
+            console.log('[DEBUG] [PORT 40000] Insert/update for connected_relays completed for', macAddress, 'Result:', result.rowCount);
+        } catch (err) {
+            console.error('[DEBUG] [PORT 40000] Error inserting/updating connected_relays for', macAddress, err);
+        }
+
+        ws.on('message', async (message) => {
+            try {
+                const data = JSON.parse(message);
+                console.log(`[PORT 40000] Received message from relay ${macAddress}:`, data);
+
+                // Handle device registration (accept both old and new formats)
+                if (data.type === 'device_register' || data.type === 'register') {
+                    console.log(`[PORT 40000] Relay ${macAddress} registering as ${data.device_name}`);
+                    
+                    // Extract MAC address from registration message
+                    const actualMac = data.mac || data.mac_address;
+                    const deviceIP = data.ip;
+                    
+                    if (actualMac) {
+                        const relayData = connectedRelays.get(macAddress);
+                        if (relayData) {
+                            relayData.actualMacAddress = actualMac;
+                            console.log(`[PORT 40000] ✅ Updated actual MAC address: ${actualMac}`);
+                        }
+                    }
+                    
+                    // Update IP address if provided
+                    if (deviceIP) {
+                        const relayData = connectedRelays.get(macAddress);
+                        if (relayData) {
+                            relayData.ip = deviceIP;
+                            console.log(`[PORT 40000] ✅ Updated IP address: ${deviceIP}`);
+                        }
+                        
+                        // Update IP address in database
+                        try {
+                            await db.query(`
+                                UPDATE relays 
+                                SET ip_address = $1, last_seen = CURRENT_TIMESTAMP
+                                WHERE mac_address = $2
+                            `, [deviceIP, macAddress]);
+                            console.log(`[PORT 40000] ✅ Updated relay IP address in database: ${macAddress} -> ${deviceIP}`);
+                        } catch (err) {
+                            console.error(`[PORT 40000] Error updating relay IP address in database for ${macAddress}:`, err);
+                        }
+                    }
+                }
+                
+                // Handle state updates
+                if (data.type === 'full_state' || data.type === 'state') {
+                    console.log(`[PORT 40000] Relay ${macAddress} state:`, {
+                        relays: data.relays,
+                        inputs: data.inputs
+                    });
+                    
+                    // Update IP address if provided in state message
+                    if (data.ip) {
+                        const relayData = connectedRelays.get(macAddress);
+                        if (relayData) {
+                            relayData.ip = data.ip;
+                        }
+                    }
+                    
+                    // Process DI inputs if they exist
+                    if (data.inputs && Array.isArray(data.inputs)) {
+                        await processDIInputs(macAddress, data.inputs);
+                    }
+                }
+                
+                // Relay is now ready to receive commands
+                console.log(`[PORT 40000] Relay ${macAddress} is ready to receive commands`);
+            } catch (error) {
+                console.error(`[PORT 40000] Error parsing message from relay ${macAddress}:`, error);
+            }
+        });
+
+        ws.on('close', async () => {
+            const relayData = connectedRelays.get(macAddress);
+            const relayIP = relayData ? relayData.ip : 'unknown';
+            console.log(`[PORT 40000] Relay disconnected: ${macAddress} from IP: ${relayIP}`);
+            connectedRelays.delete(macAddress);
+
+            // Update relay status to offline
+            try {
+                await db.query(`
+                    UPDATE relays 
+                    SET status = 'offline'
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`[PORT 40000] Updated relay status to offline: ${macAddress}`);
+            } catch (err) {
+                console.error(`[PORT 40000] Error updating relay status for ${macAddress}:`, err);
+            }
+            // Update connected_relays table to mark as offline
+            try {
+                await db.query(`
+                    UPDATE connected_relays
+                    SET status = 'offline', is_connected = FALSE, last_seen = CURRENT_TIMESTAMP
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`Updated connected_relays status to offline: ${macAddress}`);
+            } catch (err) {
+                console.error(`Error updating connected_relays status for ${macAddress}:`, err);
+            }
+        });
+
+        ws.on('error', async (error) => {
+            const relayData = connectedRelays.get(macAddress);
+            const relayIP = relayData ? relayData.ip : 'unknown';
+            console.error(`[PORT 40000] Error with relay ${macAddress} from IP: ${relayIP}:`, error);
+            connectedRelays.delete(macAddress);
+            
+            // Update relay status to error
+            try {
+                await db.query(`
+                    UPDATE relays 
+                    SET status = 'error'
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`[PORT 40000] Updated relay status to error: ${macAddress}`);
+            } catch (err) {
+                console.error(`[PORT 40000] Error updating relay status for ${macAddress}:`, err);
+            }
+            // Update connected_relays table to mark as error
+            try {
+                await db.query(`
+                    UPDATE connected_relays
+                    SET status = 'error', is_connected = FALSE, last_seen = CURRENT_TIMESTAMP
+                    WHERE mac_address = $1
+                `, [macAddress]);
+                console.log(`Updated connected_relays status to error: ${macAddress}`);
+            } catch (err) {
+                console.error(`Error updating connected_relays status for ${macAddress}:`, err);
+            }
+        });
+    } else {
+        console.log('[PORT 40000] Connection attempt without MAC address - ignoring');
+        console.log(`[DEBUG] No MAC address found in URL: ${req.url}`);
+        ws.close();
+    }
+});
+
+// New API endpoint to send commands to a specific relay
+app.post('/api/relays/:mac/command', async (req, res) => {
+    const { mac } = req.params;
+    const { command, type, relay, state } = req.body;
+
+    // Simple relay command - send relay number directly to ESP32
+    const messageToSend = {
+        type: 'relay_control',
+        relay: relay,  // Use relay number directly (0-7)
+        state: state
+    };
+
+    const relayData = connectedRelays.get(mac);
+
+    if (relayData && relayData.ws.readyState === WebSocket.OPEN) {
+        relayData.ws.send(JSON.stringify(messageToSend));
+        res.status(200).json({ message: `Command '${messageToSend.type}' sent to relay ${mac} at IP: ${relayData.ip}` });
+    } else {
+        res.status(404).json({ error: `Relay with MAC address ${mac} not connected or not ready.` });
+    }
+});
+
+// API endpoint to get all assigned relays grouped by template with detailed information
+app.get('/api/assigned-relays', authenticateToken, async (req, res) => {
+    try {
+        const templatesResult = await db.query('SELECT id, name, color FROM templates ORDER BY name');
+        const templates = templatesResult.rows;
+        const result = [];
+        
+        for (const template of templates) {
+            const relaysResult = await db.query(`
+                SELECT 
+                    cr.id,
+                    cr.mac_address, 
+                    cr.name, 
+                    cr.device_name, 
+                    cr.status, 
+                    cr.is_connected,
+                    cr.ip_address,
+                    cr.port,
+                    cr.location,
+                    cr.description,
+                    cr.last_seen,
+                    ra.assignment_type,
+                    rc.relay_name as config_name
+                FROM relay_assignments ra
+                INNER JOIN connected_relays cr ON ra.connected_relay_id = cr.id
+                LEFT JOIN relay_configurations rc ON cr.relay_configuration_id = rc.id
+                WHERE ra.template_id = $1
+                ORDER BY cr.name
+            `, [template.id]);
+            
+            // Get channel configurations for each relay
+            const relaysWithConfig = [];
+            for (const r of relaysResult.rows) {
+                const configResult = await db.query(`
+                    SELECT channel_1, channel_2, channel_3, channel_4, channel_5, channel_6, channel_7, channel_8
+                    FROM relay_settings 
+                    WHERE connected_relay_id = $1 AND template_id = $2
+                `, [r.id, template.id]);
+                
+                const channelConfig = {};
+                if (configResult.rows.length > 0) {
+                    const config = configResult.rows[0];
+                    for (let i = 1; i <= 8; i++) {
+                        if (config[`channel_${i}`]) {
+                            channelConfig[i] = config[`channel_${i}`];
+                        }
+                    }
+                }
+                
+                relaysWithConfig.push({
+                    id: r.id,
+                    mac_address: r.mac_address,
+                    name: r.name || r.device_name || `Relay-${r.mac_address.substring(r.mac_address.length-6)}`,
+                    status: r.status,
+                    is_connected: r.is_connected,
+                    ip_address: r.ip_address,
+                    port: r.port || 81,
+                    location: r.location,
+                    description: r.description,
+                    last_seen: r.last_seen,
+                    assignment_type: r.assignment_type,
+                    config_name: r.config_name,
+                    channel_config: channelConfig
+                });
+            }
+            
+            result.push({
+                id: template.id,
+                name: template.name,
+                color: template.color,
+                relays: relaysWithConfig
+            });
+        }
+        res.json({ templates: result });
+    } catch (err) {
+        console.error('Error fetching assigned relays:', err);
+        res.status(500).json({ error: 'Failed to fetch assigned relays' });
+    }
+});
+
+// API endpoint to unassign a relay from a template
+app.delete('/api/assigned-relays/:templateId/:relayId', authenticateToken, async (req, res) => {
+    const { templateId, relayId } = req.params;
+    
+    console.log(`[DEBUG] Attempting to unassign relay ${relayId} from template ${templateId}`);
+    
+    try {
+        // Check if assignment exists first
+        const checkResult = await db.query(
+            'SELECT * FROM relay_assignments WHERE template_id = $1 AND connected_relay_id = $2',
+            [templateId, relayId]
+        );
+        
+        console.log(`[DEBUG] Found ${checkResult.rows.length} existing assignments`);
+        
+        // Delete the assignment
+        const assignmentResult = await db.query(
+            'DELETE FROM relay_assignments WHERE template_id = $1 AND connected_relay_id = $2',
+            [templateId, relayId]
+        );
+        
+        console.log(`[DEBUG] Deleted ${assignmentResult.rowCount} assignments`);
+        
+        if (assignmentResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Assignment not found' });
+        }
+        
+        // Also delete the relay settings for this assignment
+        const settingsResult = await db.query(
+            'DELETE FROM relay_settings WHERE template_id = $1 AND connected_relay_id = $2',
+            [templateId, relayId]
+        );
+        
+        console.log(`[DEBUG] Deleted ${settingsResult.rowCount} relay settings`);
+        
+        res.status(204).send();
+    } catch (err) {
+        console.error('Error removing relay assignment:', err);
+        res.status(500).json({ error: 'Failed to remove relay assignment' });
+    }
+});
+
+// Utility function to send relay commands using the correct format
+async function sendRelayCommandByFunction(macAddress, relayIndex, state) {
+    try {
+        const relayData = connectedRelays.get(macAddress);
+        if (!relayData || !relayData.ws || relayData.ws.readyState !== WebSocket.OPEN) {
+            throw new Error(`Relay ${macAddress} is not connected`);
+        }
+        
+        const command = {
+            type: 'set_relay',
+            device_id: macAddress,
+            relay: relayIndex.toString(), // Convert to string as expected by ESP32
+            state: state
+        };
+        
+        console.log(`[RELAY] Sending command to ${macAddress}:`, command);
+        relayData.ws.send(JSON.stringify(command));
+        
+        return true;
+    } catch (error) {
+        console.error(`[RELAY] Error sending command to ${macAddress}:`, error);
+        throw error;
+    }
+}
+
+// Helper function to find relay channel for a specific function
+async function findRelayChannelForFunction(templateId, macAddress, functionName) {
+    try {
+        const result = await db.query(`
+            SELECT rs.channel_1, rs.channel_2, rs.channel_3, rs.channel_4, 
+                   rs.channel_5, rs.channel_6, rs.channel_7, rs.channel_8
+            FROM relay_settings rs
+            JOIN connected_relays cr ON rs.connected_relay_id = cr.id
+            WHERE rs.template_id = $1 AND cr.mac_address = $2
+        `, [templateId, macAddress]);
+        
+        if (result.rows.length === 0) {
+            throw new Error(`No relay settings found for template ${templateId} and relay ${macAddress}`);
+        }
+        
+        const settings = result.rows[0];
+        for (let i = 1; i <= 8; i++) {
+            if (settings[`channel_${i}`] === functionName) {
+                return i - 1; // Return 0-based index for ESP32
+            }
+        }
+        
+        throw new Error(`Function ${functionName} not found in relay ${macAddress} configuration`);
+    } catch (error) {
+        console.error(`[RELAY] Error finding channel for function:`, error);
+        throw error;
+    }
+}
+
+// Get unified elevator status from all relays in a template
+async function getUnifiedElevatorStatus(templateId) {
+    try {
+        // Get all elevator relays for this template
+        const elevatorRelays = await getElevatorRelaysForTemplateFromDB(templateId);
+        
+        if (elevatorRelays.length === 0) {
+            return null;
+        }
+        
+        // Aggregate status from all relays
+        const unifiedStatus = {
+            door_open: false,
+            door_close: false,
+            basementodt: false,
+            current_floor: null,
+            last_updated: null,
+            relay_count: elevatorRelays.length,
+            relays: []
+        };
+        
+        // Get status from each relay
+        for (const relay of elevatorRelays) {
+            const statusResult = await db.query(`
+                SELECT status_data, last_updated FROM elevator_status WHERE relay_mac = $1
+            `, [relay.mac_address]);
+            
+            if (statusResult.rows.length > 0) {
+                const relayStatus = statusResult.rows[0].status_data || {};
+                const lastUpdated = statusResult.rows[0].last_updated;
+                
+                // Aggregate door status (any relay can indicate door state)
+                if (relayStatus.door_open) unifiedStatus.door_open = true;
+                if (relayStatus.door_close) unifiedStatus.door_close = true;
+                if (relayStatus.basementodt) unifiedStatus.basementodt = true;
+                
+                // Floor status (only one floor should be active at a time)
+                if (relayStatus.current_floor && !unifiedStatus.current_floor) {
+                    unifiedStatus.current_floor = relayStatus.current_floor;
+                }
+                
+                // Track the most recent update
+                if (!unifiedStatus.last_updated || lastUpdated > unifiedStatus.last_updated) {
+                    unifiedStatus.last_updated = lastUpdated;
+                }
+                
+                unifiedStatus.relays.push({
+                    mac_address: relay.mac_address,
+                    name: relay.name,
+                    status: relayStatus,
+                    last_updated: lastUpdated
+                });
+            }
+        }
+        
+        console.log(`[ELEVATOR] Unified status for template ${templateId}:`, unifiedStatus);
+        return unifiedStatus;
+        
+    } catch (error) {
+        console.error(`[ERROR] Error getting unified elevator status for template ${templateId}:`, error);
+        return null;
+    }
+}
+
+// Wait for unified elevator status with timeout
+async function waitForUnifiedElevatorStatus(templateId, expectedStatus, timeout = 30000) {
+    console.log(`[ELEVATOR] Waiting for unified elevator status: ${JSON.stringify(expectedStatus)}`);
+    
+    const startTime = Date.now();
+    
+    return new Promise((resolve, reject) => {
+        const checkStatus = () => {
+            getUnifiedElevatorStatus(templateId).then(status => {
+                if (!status) {
+                    if (Date.now() - startTime > timeout) {
+                        reject(new Error(`Timeout waiting for elevator status after ${timeout}ms`));
+                    } else {
+                        setTimeout(checkStatus, 1000);
+                    }
+                    return;
+                }
+                
+                // Check if all expected conditions are met
+                let allConditionsMet = true;
+                for (const [key, expectedValue] of Object.entries(expectedStatus)) {
+                    if (status[key] !== expectedValue) {
+                        allConditionsMet = false;
+                        break;
+                    }
+                }
+                
+                if (allConditionsMet) {
+                    console.log(`[ELEVATOR] ✅ Unified elevator status conditions met:`, status);
+                    resolve(status);
+                } else {
+                    if (Date.now() - startTime > timeout) {
+                        reject(new Error(`Timeout waiting for elevator status. Expected: ${JSON.stringify(expectedStatus)}, Got: ${JSON.stringify(status)}`));
+                    } else {
+                        setTimeout(checkStatus, 1000);
+                    }
+                }
+            }).catch(error => {
+                if (Date.now() - startTime > timeout) {
+                    reject(error);
+                } else {
+                    setTimeout(checkStatus, 1000);
+                }
+            });
+        };
+        
+        checkStatus();
+    });
+}

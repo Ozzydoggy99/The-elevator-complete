@@ -46,13 +46,11 @@
         }
         
         /* Make sure the selector works for both create form and template cards */
-        .toggle-switch input[type="checkbox"]:checked + .toggle-label,
-        .template-stationary-toggle:checked + .toggle-label {
+        .toggle-switch input[type="checkbox"]:checked + .toggle-label {
             background-color: #4CAF50 !important;
         }
         
-        .toggle-switch input[type="checkbox"]:checked + .toggle-label .toggle-slider,
-        .template-stationary-toggle:checked + .toggle-label .toggle-slider {
+        .toggle-switch input[type="checkbox"]:checked + .toggle-label .toggle-slider {
             transform: translateX(26px);
         }
         
@@ -78,32 +76,44 @@
             </div>
             <ul class="nav-links">
                 <li>
-                    <a href="dashboard.html">
+                    <a href="admin.html">
                         <i class="icon">📊</i>
                         Dashboard
                     </a>
                 </li>
                 <li>
-                    <a href="robot-control.html">
-                        <i class="icon">🤖</i>
-                        Robot Control
-                    </a>
-                </li>
-                <li>
-                    <a href="robot-monitoring.html">
-                        <i class="icon">📡</i>
-                        Robot Monitoring
-                    </a>
-                </li>
-                <li>
                     <a href="robot-registration.html">
-                        <i class="icon">📝</i>
+                        <i class="icon">🤖</i>
                         Robot Registration
                     </a>
                 </li>
                 <li>
+                    <a href="relay-registration.html">
+                        <i class="icon">🔌</i>
+                        Relay Registration
+                    </a>
+                </li>
+                <li>
+                    <a href="relay-programming.html">
+                        <i class="icon">⚙️</i>
+                        Relay Programming
+                    </a>
+                </li>
+                <li>
+                    <a href="relay-assignments.html">
+                        <i class="icon">🔗</i>
+                        Relay Assignments
+                    </a>
+                </li>
+                <li>
+                    <a href="assigned-relays.html">
+                        <i class="icon">📋</i>
+                        Assigned Relays
+                    </a>
+                </li>
+                <li>
                     <a href="robot-assignment.html">
-                        <i class="icon">🎯</i>
+                        <i class="icon">📝</i>
                         Robot Assignment
                     </a>
                 </li>
@@ -111,6 +121,18 @@
                     <a href="user-templates.html">
                         <i class="icon">👥</i>
                         User Templates
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-control.html">
+                        <i class="icon">📡</i>
+                        Robot Control
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-monitoring.html">
+                        <i class="icon">🖥️</i>
+                        Robot Monitoring
                     </a>
                 </li>
             </ul>
@@ -182,14 +204,17 @@
                            placeholder="Enter boss password">
                 </div>
 
+
+
+                <!-- Multifloor Toggle -->
                 <div class="form-group">
-                    <label for="stationaryToggle">Stationary Rack</label>
+                    <label for="multifloorToggle">Multifloor</label>
                     <div class="toggle-switch">
-                        <input type="checkbox" id="stationaryToggle" name="stationary">
-                        <label for="stationaryToggle" class="toggle-label">
+                        <input type="checkbox" id="multifloorToggle" name="multifloor">
+                        <label for="multifloorToggle" class="toggle-label">
                             <span class="toggle-slider"></span>
                         </label>
-                        <span class="toggle-text">Use stationary rack workflows</span>
+                        <span class="toggle-text">Use multifloor workflows</span>
                     </div>
                 </div>
 
@@ -250,16 +275,7 @@
                         ` : 'No boss user assigned'}
                     </div>
                 </div>
-                <div class="form-group">
-                    <label>Stationary Rack</label>
-                    <div class="toggle-switch">
-                        <input type="checkbox" class="template-stationary-toggle" ${template.stationary ? 'checked' : ''}>
-                        <label class="toggle-label">
-                            <span class="toggle-slider"></span>
-                        </label>
-                        <span class="toggle-text">Use stationary rack workflows</span>
-                    </div>
-                </div>
+
                 <div class="template-card-actions">
                     <button class="btn btn-secondary save-btn">Save Changes</button>
                     <button class="btn btn-danger delete-btn">Delete Template</button>

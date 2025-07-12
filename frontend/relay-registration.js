@@ -1,14 +1,11 @@
-// Relay Registration System JavaScript
-class RelayRegistrationSystem {
+// Relay Configuration Registration System JavaScript
+class RelayConfigurationSystem {
     constructor() {
-        this.selectedRelayId = null;
-        this.relays = [];
-        this.robots = [];
-        this.templates = [];
-        
+        this.configurations = [];
+        this.checkAuthentication();
         this.initializeElements();
+        this.loadConfigurations();
         this.setupEventListeners();
-        this.loadData();
     }
 
     initializeElements() {
@@ -16,463 +13,235 @@ class RelayRegistrationSystem {
         this.relayForm = document.getElementById('relayForm');
         this.relayId = document.getElementById('relayId');
         this.relayName = document.getElementById('relayName');
-        this.relayType = document.getElementById('relayType');
-        this.relayIp = document.getElementById('relayIp');
-        this.relayPort = document.getElementById('relayPort');
-        this.relayDescription = document.getElementById('relayDescription');
-        
-        // Capability checkboxes
-        this.capabilityCheckboxes = document.querySelectorAll('input[type="checkbox"][value]');
-        
-        // Association elements
-        this.robotSelect = document.getElementById('robotSelect');
-        this.templateSelect = document.getElementById('templateSelect');
-        this.associateBtn = document.getElementById('associateBtn');
-        this.disassociateBtn = document.getElementById('disassociateBtn');
+        this.ssid = document.getElementById('wifiSSID');
+        this.password = document.getElementById('wifiPassword');
+        this.macAddress = document.getElementById('macAddress');
         
         // List elements
         this.relayList = document.getElementById('relayList');
         
         // Statistics elements
-        this.totalRelays = document.getElementById('totalRelays');
+        this.totalConfigs = document.getElementById('totalConfigs');
+        this.totalConnected = document.getElementById('totalConnected');
         this.onlineRelays = document.getElementById('onlineRelays');
         this.offlineRelays = document.getElementById('offlineRelays');
-        this.errorRelays = document.getElementById('errorRelays');
     }
 
     setupEventListeners() {
-        // Form submission
         this.relayForm.addEventListener('submit', (e) => {
             e.preventDefault();
-            this.registerRelay();
+            this.registerConfiguration();
         });
 
-        // Relay type change
-        this.relayType.addEventListener('change', () => {
-            this.updateCapabilitiesForType();
-        });
-
-        // Association controls
-        this.associateBtn.addEventListener('click', () => this.associateRelay());
-        this.disassociateBtn.addEventListener('click', () => this.disassociateRelay());
-
-        // Logout
-        document.getElementById('logoutBtn').addEventListener('click', () => {
-            window.location.href = 'login.html';
-        });
-    }
-
-    async loadData() {
-        try {
-            // Load relays
-            await this.loadRelays();
-            
-            // Load robots
-            await this.loadRobots();
-            
-            // Load templates
-            await this.loadTemplates();
-            
-            // Update statistics
-            this.updateStatistics();
-            
-        } catch (error) {
-            console.error('Error loading data:', error);
-            this.showNotification('Error loading data: ' + error.message, 'error');
+        // Add logout functionality
+        const logoutBtn = document.getElementById('logoutBtn');
+        if (logoutBtn) {
+            logoutBtn.addEventListener('click', () => {
+                this.logout();
+            });
         }
     }
 
-    async loadRelays() {
+    async loadConfigurations() {
         try {
-            const response = await fetch('/api/relays');
+            const response = await apiCall('/api/relay-configurations');
             if (response.ok) {
-                this.relays = await response.json();
-                this.renderRelayList();
+                this.configurations = await response.json();
+                this.renderConfigurationList();
             } else {
-                throw new Error('Failed to load relays');
+                throw new Error('Failed to load configurations');
             }
         } catch (error) {
-            console.error('Error loading relays:', error);
-            // For demo purposes, create some sample relays
-            this.relays = [
+            console.error('Error loading configurations:', error);
+            // For demo purposes, create some sample configurations
+            this.configurations = [
                 {
-                    id: 'elevator-001',
-                    name: 'Main Building Elevator',
-                    type: 'elevator',
-                    ip: '192.168.1.100',
-                    port: 81,
-                    status: 'online',
-                    capabilities: ['door_control', 'floor_selection', 'status_monitoring'],
-                    robotId: 'robot-001',
-                    templateId: 'template-001'
+                    id: 1,
+                    relay_id: 'elevator-main-001',
+                    relay_name: 'Main Building Elevator',
+                    ssid: 'Skytech_Robots',
+                    created_at: '2024-01-15T10:30:00Z'
                 },
                 {
-                    id: 'door-001',
-                    name: 'Warehouse Door',
-                    type: 'door',
-                    ip: '192.168.1.101',
-                    port: 81,
-                    status: 'offline',
-                    capabilities: ['door_control', 'status_monitoring'],
-                    robotId: null,
-                    templateId: null
+                    id: 2,
+                    relay_id: 'elevator-floors-001',
+                    relay_name: 'Floors Only Relay',
+                    ssid: 'Skytech_Robots',
+                    created_at: '2024-01-16T14:20:00Z'
                 }
             ];
-            this.renderRelayList();
+            this.renderConfigurationList();
         }
     }
 
-    async loadRobots() {
+    async registerConfiguration() {
         try {
-            const response = await fetch('/api/robots');
-            if (response.ok) {
-                this.robots = await response.json();
-            } else {
-                // For demo purposes, create sample robots
-                this.robots = [
-                    { id: 'robot-001', name: 'Robot Alpha', serialNumber: 'L382502104987ir' },
-                    { id: 'robot-002', name: 'Robot Beta', serialNumber: 'L382502104988ir' }
-                ];
+            // Validate MAC address format if provided
+            const macAddress = this.macAddress.value.trim();
+            if (macAddress && !this.isValidMacAddress(macAddress)) {
+                this.showNotification('Invalid MAC address format. Use format: AA:BB:CC:DD:EE:FF', 'error');
+                return;
             }
-            this.populateRobotSelect();
-        } catch (error) {
-            console.error('Error loading robots:', error);
-        }
-    }
 
-    async loadTemplates() {
-        try {
-            const response = await fetch('/api/templates');
-            if (response.ok) {
-                this.templates = await response.json();
-            } else {
-                // For demo purposes, create sample templates
-                this.templates = [
-                    { id: 'template-001', name: 'Multi-Floor Pickup', type: 'pickup' },
-                    { id: 'template-002', name: 'Single Floor Dropoff', type: 'dropoff' }
-                ];
-            }
-            this.populateTemplateSelect();
-        } catch (error) {
-            console.error('Error loading templates:', error);
-        }
-    }
+            const configData = {
+                relay_id: this.relayId.value,
+                relay_name: this.relayName.value,
+                ssid: this.ssid.value,
+                password: this.password.value,
+                mac_address: macAddress || null
+            };
 
-    populateRobotSelect() {
-        this.robotSelect.innerHTML = '<option value="">Select Robot</option>';
-        this.robots.forEach(robot => {
-            const option = document.createElement('option');
-            option.value = robot.id;
-            option.textContent = `${robot.name} (${robot.serialNumber})`;
-            this.robotSelect.appendChild(option);
-        });
-    }
-
-    populateTemplateSelect() {
-        this.templateSelect.innerHTML = '<option value="">Select Template</option>';
-        this.templates.forEach(template => {
-            const option = document.createElement('option');
-            option.value = template.id;
-            option.textContent = `${template.name} (${template.type})`;
-            this.templateSelect.appendChild(option);
-        });
-    }
-
-    updateCapabilitiesForType() {
-        const type = this.relayType.value;
-        
-        // Reset all checkboxes
-        this.capabilityCheckboxes.forEach(checkbox => {
-            checkbox.checked = false;
-        });
-        
-        // Set default capabilities based on type
-        switch (type) {
-            case 'elevator':
-                this.setCapability('door_control', true);
-                this.setCapability('floor_selection', true);
-                this.setCapability('status_monitoring', true);
-                this.setCapability('emergency_stop', true);
-                break;
-            case 'door':
-                this.setCapability('door_control', true);
-                this.setCapability('status_monitoring', true);
-                break;
-            case 'light':
-                this.setCapability('light_control', true);
-                this.setCapability('status_monitoring', true);
-                break;
-            case 'gate':
-                this.setCapability('gate_control', true);
-                this.setCapability('status_monitoring', true);
-                break;
-        }
-    }
-
-    setCapability(capability, checked) {
-        const checkbox = document.getElementById(`cap_${capability}`);
-        if (checkbox) {
-            checkbox.checked = checked;
-        }
-    }
-
-    getSelectedCapabilities() {
-        const capabilities = [];
-        this.capabilityCheckboxes.forEach(checkbox => {
-            if (checkbox.checked) {
-                capabilities.push(checkbox.value);
-            }
-        });
-        return capabilities;
-    }
-
-    async registerRelay() {
-        const relayData = {
-            id: this.relayId.value,
-            name: this.relayName.value,
-            type: this.relayType.value,
-            ip: this.relayIp.value,
-            port: parseInt(this.relayPort.value),
-            description: this.relayDescription.value,
-            capabilities: this.getSelectedCapabilities()
-        };
-
-        try {
-            const response = await fetch('/api/relays', {
+            const response = await apiCall('/api/relay-configurations', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(relayData)
+                body: JSON.stringify(configData)
             });
 
             if (response.ok) {
-                const newRelay = await response.json();
-                this.relays.push(newRelay);
-                this.renderRelayList();
-                this.updateStatistics();
+                const newConfig = await response.json();
+                this.configurations.push(newConfig);
+                this.renderConfigurationList();
                 this.relayForm.reset();
                 this.showNotification('Relay registered successfully', 'success');
             } else {
-                throw new Error('Failed to register relay');
+                const error = await response.json();
+                throw new Error(error.error || 'Failed to register relay');
             }
         } catch (error) {
             console.error('Error registering relay:', error);
-            this.showNotification('Error registering relay: ' + error.message, 'error');
+            this.showNotification(error.message, 'error');
         }
     }
 
-    renderRelayList() {
+    renderConfigurationList() {
         this.relayList.innerHTML = '';
         
-        this.relays.forEach(relay => {
-            const relayEl = document.createElement('div');
-            relayEl.className = 'relay-item';
-            relayEl.dataset.relayId = relay.id;
+        this.configurations.forEach(config => {
+            const configEl = document.createElement('div');
+            configEl.className = 'relay-item';
+            configEl.dataset.configId = config.id;
             
-            relayEl.innerHTML = `
+            const macDisplay = config.mac_address ? `<div><strong>MAC:</strong> ${config.mac_address}</div>` : '';
+            
+            configEl.innerHTML = `
                 <div class="relay-header">
-                    <div class="relay-name">${relay.name}</div>
-                    <div class="relay-status status-${relay.status}">${relay.status.toUpperCase()}</div>
+                    <div class="relay-name">${config.relay_name}</div>
                 </div>
                 <div class="relay-details">
-                    <div><strong>ID:</strong> ${relay.id}</div>
-                    <div><strong>Type:</strong> ${relay.type}</div>
-                    <div><strong>IP:</strong> ${relay.ip}:${relay.port}</div>
-                    <div><strong>Capabilities:</strong> ${relay.capabilities.join(', ')}</div>
-                </div>
-                <div class="relay-associations">
-                    ${relay.robotId ? `<span class="association-tag robot">Robot: ${this.getRobotName(relay.robotId)}</span>` : ''}
-                    ${relay.templateId ? `<span class="association-tag template">Template: ${this.getTemplateName(relay.templateId)}</span>` : ''}
+                    <div><strong>ID:</strong> ${config.relay_id}</div>
+                    <div><strong>WiFi:</strong> ${config.ssid}</div>
+                    ${macDisplay}
+                    <div><strong>Created:</strong> ${new Date(config.created_at).toLocaleDateString()}</div>
                 </div>
             `;
             
-            relayEl.addEventListener('click', () => {
-                this.selectRelay(relay.id);
+            configEl.addEventListener('click', () => {
+                this.selectConfiguration(config.id);
             });
             
-            this.relayList.appendChild(relayEl);
+            this.relayList.appendChild(configEl);
         });
     }
 
-    selectRelay(relayId) {
-        // Remove previous selection
+    selectConfiguration(configId) {
+        // Remove active class from all items
         document.querySelectorAll('.relay-item').forEach(item => {
-            item.classList.remove('selected');
+            item.classList.remove('active');
         });
         
-        // Add selection to clicked item
-        const relayEl = document.querySelector(`[data-relay-id="${relayId}"]`);
-        if (relayEl) {
-            relayEl.classList.add('selected');
+        // Add active class to selected item
+        const selectedItem = document.querySelector(`[data-config-id="${configId}"]`);
+        if (selectedItem) {
+            selectedItem.classList.add('active');
         }
-        
-        this.selectedRelayId = relayId;
-        
-        // Update association controls
-        const relay = this.relays.find(r => r.id === relayId);
-        if (relay) {
-            this.robotSelect.value = relay.robotId || '';
-            this.templateSelect.value = relay.templateId || '';
-        }
-    }
-
-    getRobotName(robotId) {
-        const robot = this.robots.find(r => r.id === robotId);
-        return robot ? robot.name : 'Unknown';
-    }
-
-    getTemplateName(templateId) {
-        const template = this.templates.find(t => t.id === templateId);
-        return template ? template.name : 'Unknown';
-    }
-
-    async associateRelay() {
-        if (!this.selectedRelayId) {
-            this.showNotification('Please select a relay first', 'error');
-            return;
-        }
-
-        const robotId = this.robotSelect.value;
-        const templateId = this.templateSelect.value;
-
-        try {
-            const response = await fetch(`/api/relays/${this.selectedRelayId}/associate`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ robotId, templateId })
-            });
-
-            if (response.ok) {
-                // Update local data
-                const relay = this.relays.find(r => r.id === this.selectedRelayId);
-                if (relay) {
-                    relay.robotId = robotId || null;
-                    relay.templateId = templateId || null;
-                }
-                
-                this.renderRelayList();
-                this.showNotification('Relay associated successfully', 'success');
-            } else {
-                throw new Error('Failed to associate relay');
-            }
-        } catch (error) {
-            console.error('Error associating relay:', error);
-            this.showNotification('Error associating relay: ' + error.message, 'error');
-        }
-    }
-
-    async disassociateRelay() {
-        if (!this.selectedRelayId) {
-            this.showNotification('Please select a relay first', 'error');
-            return;
-        }
-
-        try {
-            const response = await fetch(`/api/relays/${this.selectedRelayId}/disassociate`, {
-                method: 'POST'
-            });
-
-            if (response.ok) {
-                // Update local data
-                const relay = this.relays.find(r => r.id === this.selectedRelayId);
-                if (relay) {
-                    relay.robotId = null;
-                    relay.templateId = null;
-                }
-                
-                this.renderRelayList();
-                this.robotSelect.value = '';
-                this.templateSelect.value = '';
-                this.showNotification('Relay disassociated successfully', 'success');
-            } else {
-                throw new Error('Failed to disassociate relay');
-            }
-        } catch (error) {
-            console.error('Error disassociating relay:', error);
-            this.showNotification('Error disassociating relay: ' + error.message, 'error');
-        }
-    }
-
-    updateStatistics() {
-        const total = this.relays.length;
-        const online = this.relays.filter(r => r.status === 'online').length;
-        const offline = this.relays.filter(r => r.status === 'offline').length;
-        const error = this.relays.filter(r => r.status === 'error').length;
-
-        this.totalRelays.textContent = total;
-        this.onlineRelays.textContent = online;
-        this.offlineRelays.textContent = offline;
-        this.errorRelays.textContent = error;
     }
 
     showNotification(message, type = 'info') {
-        // Create notification element
         const notification = document.createElement('div');
         notification.className = `notification ${type}`;
         notification.textContent = message;
-        notification.style.cssText = `
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            padding: 15px 20px;
-            border-radius: 5px;
-            color: white;
-            font-weight: bold;
-            z-index: 1000;
-            animation: slideIn 0.3s ease;
-        `;
-
-        // Set background color based on type
-        switch (type) {
-            case 'success':
-                notification.style.backgroundColor = '#4CAF50';
-                break;
-            case 'error':
-                notification.style.backgroundColor = '#f44336';
-                break;
-            case 'warning':
-                notification.style.backgroundColor = '#ff9800';
-                break;
-            default:
-                notification.style.backgroundColor = '#2196F3';
-        }
-
-        document.body.appendChild(notification);
-
-        // Remove notification after 3 seconds
+        
+        const container = document.getElementById('notificationContainer');
+        container.appendChild(notification);
+        
+        // Show notification
+        setTimeout(() => notification.classList.add('show'), 100);
+        
+        // Remove notification after 5 seconds
         setTimeout(() => {
-            notification.style.animation = 'slideOut 0.3s ease';
-            setTimeout(() => {
-                if (notification.parentNode) {
-                    notification.parentNode.removeChild(notification);
-                }
-            }, 300);
-        }, 3000);
+            notification.classList.remove('show');
+            setTimeout(() => container.removeChild(notification), 300);
+        }, 5000);
+    }
+
+    isValidMacAddress(mac) {
+        // MAC address format: AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF
+        const macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
+        return macRegex.test(mac);
+    }
+
+    logout() {
+        // Clear authentication data
+        localStorage.removeItem('token');
+        localStorage.removeItem('username');
+        
+        // Redirect to login page
+        window.location.href = 'login.html';
+    }
+
+    checkAuthentication() {
+        const token = localStorage.getItem('token');
+        const username = localStorage.getItem('username');
+        
+        if (!token) {
+            // No token found, redirect to login
+            window.location.href = 'login.html';
+            return;
+        }
+        
+        // Display username
+        const usernameElement = document.getElementById('username');
+        if (usernameElement && username) {
+            usernameElement.textContent = username;
+        }
     }
 }
 
-// Add CSS animations
-const style = document.createElement('style');
-style.textContent = `
-    @keyframes slideIn {
-        from { transform: translateX(100%); opacity: 0; }
-        to { transform: translateX(0); opacity: 1; }
-    }
-    
-    @keyframes slideOut {
-        from { transform: translateX(0); opacity: 1; }
-        to { transform: translateX(100%); opacity: 0; }
-    }
-`;
-document.head.appendChild(style);
-
-// Initialize the relay registration system when the page loads
+// Initialize the system when the page loads
 document.addEventListener('DOMContentLoaded', () => {
-    const relaySystem = new RelayRegistrationSystem();
-    
-    // Make it globally accessible for debugging
-    window.relaySystem = relaySystem;
-}); 
+    new RelayConfigurationSystem();
+});
+
+// Global function for clearing form
+function clearForm() {
+    document.getElementById('relayForm').reset();
+}
+
+function apiCall(endpoint, options = {}) {
+    const token = localStorage.getItem('token');
+    const baseUrl = window.location.origin;
+    const defaultOptions = {
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        }
+    };
+    return fetch(`${baseUrl}${endpoint}`, { ...defaultOptions, ...options });
+} 
+ // Global function for clearing form
+function clearForm() {
+    document.getElementById('relayForm').reset();
+}
+
+function apiCall(endpoint, options = {}) {
+    const token = localStorage.getItem('token');
+    const baseUrl = window.location.origin;
+    const defaultOptions = {
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        }
+    };
+    return fetch(`${baseUrl}${endpoint}`, { ...defaultOptions, ...options });
+} 
+ 
+

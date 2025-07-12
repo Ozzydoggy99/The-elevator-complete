@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Assigned Relays - Admin Interface</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        .relay-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 20px;
+            padding: 20px;
+        }
+        
+        .relay-card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .relay-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+        }
+        
+        .relay-card-header {
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .relay-card-header h3 {
+            margin: 0;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        
+        .relay-card-header .template-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+            color: white;
+        }
+        
+        .unassign-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background-color 0.2s;
+        }
+        
+        .unassign-btn:hover {
+            background: #c82333;
+        }
+        
+        .relay-card-content {
+            padding: 20px;
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+        }
+        
+        .relay-card.expanded .relay-card-content {
+            max-height: 1000px;
+            transition: max-height 0.3s ease-in;
+        }
+        
+        .relay-info {
+            margin-bottom: 20px;
+        }
+        
+        .relay-info-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            padding: 8px 0;
+            border-bottom: 1px solid #f5f5f5;
+        }
+        
+        .relay-info-item:last-child {
+            border-bottom: none;
+        }
+        
+        .relay-info-label {
+            font-weight: 500;
+            color: #666;
+        }
+        
+        .relay-info-value {
+            color: #333;
+        }
+        
+        .status-online {
+            color: #28a745;
+            font-weight: 600;
+        }
+        
+        .status-offline {
+            color: #dc3545;
+            font-weight: 600;
+        }
+        
+        .channel-config {
+            margin-top: 20px;
+        }
+        
+        .channel-config h4 {
+            margin-bottom: 15px;
+            color: #333;
+            font-size: 16px;
+        }
+        
+        .channel-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+        
+        .channel-item {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .channel-item label {
+            font-weight: 500;
+            margin-bottom: 5px;
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .channel-item select {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .save-config-btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 15px;
+            transition: background-color 0.2s;
+        }
+        
+        .save-config-btn:hover {
+            background: #0056b3;
+        }
+        
+        .save-config-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        .expand-btn {
+            background: none;
+            border: none;
+            font-size: 16px;
+            cursor: pointer;
+            color: #666;
+            transition: color 0.2s;
+        }
+        
+        .expand-btn:hover {
+            color: #333;
+        }
+        
+        .no-assignments {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="admin-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>Robot Admin</h2>
+            </div>
+            <ul class="nav-links">
+                <li><a href="admin.html"><i class="icon">📊</i>Dashboard</a></li>
+                <li><a href="robot-registration.html"><i class="icon">🤖</i>Robot Registration</a></li>
+                <li><a href="relay-registration.html"><i class="icon">🔌</i>Relay Registration</a></li>
+                <li><a href="relay-programming.html"><i class="icon">⚙️</i>Relay Programming</a></li>
+                <li><a href="relay-assignments.html"><i class="icon">🔗</i>Relay Assignments</a></li>
+                <li class="active"><a href="assigned-relays.html"><i class="icon">📋</i>Assigned Relays</a></li>
+                <li><a href="robot-assignment.html"><i class="icon">📝</i>Robot Assignment</a></li>
+                <li><a href="user-templates.html"><i class="icon">👥</i>User Templates</a></li>
+                <li><a href="robot-control.html"><i class="icon">📡</i>Robot Control</a></li>
+                <li><a href="robot-monitoring.html"><i class="icon">🖥️</i>Robot Monitoring</a></li>
+            </ul>
+            <div class="sidebar-footer">
+                <button id="logoutBtn" class="btn btn-danger">Logout</button>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="content-header">
+                <h1>Assigned Relays</h1>
+                <div class="header-actions">
+                    <div class="user-info">
+                        <span id="username">Loading...</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Relay Grid -->
+            <div class="relay-grid" id="relayGrid">
+                <!-- Relay cards will be dynamically added here -->
+            </div>
+        </main>
+    </div>
+    <script src="assigned-relays.js"></script>
+</body>
+</html> 

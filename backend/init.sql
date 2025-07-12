@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS templates (
     color VARCHAR(50) NOT NULL,
     robot JSONB,
     boss_user JSONB,
-    stationary BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

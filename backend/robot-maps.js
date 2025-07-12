@@ -97,6 +97,40 @@ async function getRobotMaps(robot) {
     }
 }
 
+// Fetch maps for all robots
+async function fetchAllRobotMaps() {
+    try {
+        // Get all robots from the database
+        const robots = await db.query('SELECT * FROM robots');
+        
+        const allRobotMaps = [];
+        for (const robotRow of robots.rows) {
+            const robot = {
+                serialNumber: robotRow.serial_number,
+                publicIP: robotRow.public_ip,
+                privateIP: robotRow.private_ip,
+                secretKey: robotRow.secret_key
+            };
+            
+            try {
+                const maps = await getRobotMaps(robot);
+                allRobotMaps.push({
+                    robot: robot,
+                    maps: maps
+                });
+            } catch (err) {
+                console.error(`Error fetching maps for robot ${robot.serialNumber}:`, err);
+                // Continue with other robots even if one fails
+            }
+        }
+        
+        return allRobotMaps;
+    } catch (err) {
+        console.error('Error in fetchAllRobotMaps:', err);
+        return [];
+    }
+}
+
 // Example usage
 let robotMapsData = null;
 
@@ -144,5 +178,6 @@ updateRobotMaps();
 setInterval(updateRobotMaps, 30000);
 
 module.exports = {
-    getRobotMaps
+    getRobotMaps,
+    fetchAllRobotMaps
 }; 

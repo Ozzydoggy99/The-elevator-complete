@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relay Assignments - Robot Admin</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .assignments-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 20px;
+        }
+
+        .assignments-panel {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .connected-relay {
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+
+        .connected-relay:hover {
+            background: #e9ecef;
+            transform: translateY(-2px);
+        }
+
+        .connected-relay.selected {
+            background: #e3f2fd;
+            border-color: #2196F3;
+        }
+
+        .relay-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .relay-name {
+            font-weight: bold;
+            font-size: 16px;
+        }
+
+        .relay-status {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .status-online { background: #4CAF50; color: white; }
+        .status-offline { background: #f44336; color: white; }
+        .status-error { background: #ff9800; color: white; }
+
+        .relay-details {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 10px;
+        }
+
+        .relay-capabilities {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+        }
+
+        .relay-assignments {
+            font-size: 12px;
+            color: #888;
+        }
+
+        .assignment-tag {
+            display: inline-block;
+            background: #e0e0e0;
+            padding: 2px 6px;
+            border-radius: 10px;
+            margin: 2px;
+            font-size: 11px;
+        }
+
+        .assignment-tag.elevator { background: #bbdefb; }
+        .assignment-tag.door { background: #c8e6c9; }
+        .assignment-tag.light { background: #fff3e0; }
+        .assignment-tag.floors { background: #f3e5f5; }
+
+        .template-list {
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 10px;
+            background: #f9f9f9;
+        }
+
+        .template-item {
+            padding: 10px;
+            margin: 5px 0;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .template-item:hover {
+            background: #e3f2fd;
+            border-color: #2196F3;
+        }
+
+        .template-item.selected {
+            background: #2196F3;
+            color: white;
+            border-color: #1976D2;
+        }
+
+        .template-name {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .template-type {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+
+        .assignment-controls {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            display: none;
+        }
+
+        .assignment-controls h3 {
+            margin-top: 0;
+            margin-bottom: 15px;
+        }
+
+        .control-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .control-group label {
+            min-width: 120px;
+            font-weight: bold;
+        }
+
+        .control-group select,
+        .control-group input {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .control-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s ease;
+        }
+
+        .btn-primary {
+            background: #2196F3;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #1976D2;
+        }
+
+        .btn-primary:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .btn-danger:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .statistics {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 24px;
+            font-weight: bold;
+            color: #2196F3;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 20px;
+            border-radius: 5px;
+            color: white;
+            font-weight: bold;
+            z-index: 1000;
+            animation: slideIn 0.3s ease;
+        }
+
+        .notification.success {
+            background: #4CAF50;
+        }
+
+        .notification.error {
+            background: #f44336;
+        }
+
+        .notification.info {
+            background: #2196F3;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="admin-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>Robot Admin</h2>
+            </div>
+            <ul class="nav-links">
+                <li>
+                    <a href="admin.html">
+                        <i class="icon">📊</i>
+                        Dashboard
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-registration.html">
+                        <i class="icon">🤖</i>
+                        Robot Registration
+                    </a>
+                </li>
+                <li>
+                    <a href="relay-registration.html">
+                        <i class="icon">🔌</i>
+                        Relay Registration
+                    </a>
+                </li>
+                <li>
+                    <a href="relay-programming.html">
+                        <i class="icon">⚙️</i>
+                        Relay Programming
+                    </a>
+                </li>
+                <li class="active">
+                    <a href="relay-assignments.html">
+                        <i class="icon">🔗</i>
+                        Relay Assignments
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-assignment.html">
+                        <i class="icon">📝</i>
+                        Robot Assignment
+                    </a>
+                </li>
+                <li>
+                    <a href="user-templates.html">
+                        <i class="icon">👥</i>
+                        User Templates
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-control.html">
+                        <i class="icon">📡</i>
+                        Robot Control
+                    </a>
+                </li>
+                <li>
+                    <a href="robot-monitoring.html">
+                        <i class="icon">🖥️</i>
+                        Robot Monitoring
+                    </a>
+                </li>
+            </ul>
+            <div class="sidebar-footer">
+                <button id="logoutBtn" class="btn btn-danger">Logout</button>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="content-header">
+                <h1>Relay Assignments</h1>
+                <div class="user-info">
+                    <span id="username">Loading...</span>
+                </div>
+            </header>
+
+            <div class="content-body">
+                <!-- Statistics -->
+                <div class="statistics">
+                    <div class="stat-card">
+                        <div class="stat-number" id="totalConnected">0</div>
+                        <div class="stat-label">Connected Relays</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="assignedRelays">0</div>
+                        <div class="stat-label">Assigned Relays</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="onlineRelays">0</div>
+                        <div class="stat-label">Online Relays</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="totalTemplates">0</div>
+                        <div class="stat-label">Available Templates</div>
+                    </div>
+                </div>
+
+                <!-- Assignment Controls -->
+                <div class="assignment-controls" id="assignmentControls">
+                    <h3>Assign Relay to Template</h3>
+                    <div class="control-group">
+                        <label for="relaySelect">Relay:</label>
+                        <select id="relaySelect" name="relaySelect" required>
+                            <option value="">Choose a relay...</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label for="templateSelect">Template:</label>
+                        <select id="templateSelect" name="templateSelect" required>
+                            <option value="">Choose a template...</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label for="assignmentType">Assignment Type:</label>
+                        <select id="assignmentType" name="assignmentType" required>
+                            <option value="primary">Primary Relay</option>
+                            <option value="secondary">Secondary Relay</option>
+                            <option value="backup">Backup Relay</option>
+                        </select>
+                    </div>
+                    <div class="control-actions">
+                        <button type="button" id="assignBtn" class="btn btn-primary" disabled>Assign Relay</button>
+                        <button type="button" id="unassignBtn" class="btn btn-danger" disabled>Remove Assignment</button>
+                    </div>
+                </div>
+
+                <!-- Assignments Overview -->
+                <div class="assignments-container">
+                    <!-- Connected Relays Panel -->
+                    <div class="assignments-panel">
+                        <h2>Connected Relays</h2>
+                        <div class="connected-relays-list" id="connectedRelaysList">
+                            <!-- Connected relays will be loaded here -->
+                        </div>
+                    </div>
+
+                    <!-- Templates Panel -->
+                    <div class="assignments-panel">
+                        <h2>Available Templates</h2>
+                        <div class="template-list" id="templateList">
+                            <!-- Templates will be loaded here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Notification container -->
+    <div id="notificationContainer"></div>
+
+    <script src="relay-assignments.js"></script>
+</body>
+</html> 
+ 
+ 
+ 

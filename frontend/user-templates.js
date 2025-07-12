@@ -161,7 +161,8 @@ document.getElementById('createTemplateForm').addEventListener('submit', async (
             username: formData.get('bossUsername'),
             password: formData.get('bossPassword')
         },
-        stationary: formData.get('stationary') === 'on'
+
+        multifloor: formData.get('multifloor') === 'on'
     };
 
     try {
@@ -259,14 +260,15 @@ function displayTemplates(templates) {
                         ` : 'No boss user assigned'}
                     </div>
                 </div>
+
                 <div class="form-group">
-                    <label>Stationary Rack</label>
+                    <label>Multifloor</label>
                     <div class="toggle-switch">
-                        <input type="checkbox" class="template-stationary-toggle" ${template.stationary ? 'checked' : ''}>
+                        <input type="checkbox" class="template-multifloor-toggle" ${template.multifloor ? 'checked' : ''}>
                         <label class="toggle-label">
                             <span class="toggle-slider"></span>
                         </label>
-                        <span class="toggle-text">Use stationary rack workflows</span>
+                        <span class="toggle-text">Use multifloor workflows with elevator</span>
                     </div>
                 </div>
                 <div class="template-card-actions">
@@ -280,30 +282,27 @@ function displayTemplates(templates) {
         const expandBtn = card.querySelector('.expand-btn');
         const saveBtn = card.querySelector('.save-btn');
         const deleteBtn = card.querySelector('.delete-btn');
-        const stationaryToggle = card.querySelector('.template-stationary-toggle');
+        const multifloorToggle = card.querySelector('.template-multifloor-toggle');
+        const multifloorLabel = card.querySelector('.template-multifloor-toggle').parentElement.querySelector('.toggle-label');
 
         expandBtn.onclick = () => {
             card.classList.toggle('expanded');
             expandBtn.textContent = card.classList.contains('expanded') ? '▲' : '▼';
         };
 
-        // Add toggle switch event listener for visual feedback
-        stationaryToggle.onchange = () => {
-            console.log('Stationary toggle changed:', stationaryToggle.checked);
-            // The visual change should be handled by CSS, but let's ensure it works
-            const toggleLabel = card.querySelector('.toggle-label');
-            if (stationaryToggle.checked) {
-                toggleLabel.style.backgroundColor = '#4CAF50';
+
+
+        // Multifloor toggle event
+        multifloorToggle.onchange = () => {
+            if (multifloorToggle.checked) {
+                multifloorLabel.style.backgroundColor = '#4CAF50';
             } else {
-                toggleLabel.style.backgroundColor = '#ccc';
+                multifloorLabel.style.backgroundColor = '#ccc';
             }
         };
-
-        // Add click handler to toggle label for better responsiveness
-        const toggleLabel = card.querySelector('.toggle-label');
-        toggleLabel.onclick = () => {
-            stationaryToggle.checked = !stationaryToggle.checked;
-            stationaryToggle.dispatchEvent(new Event('change'));
+        multifloorLabel.onclick = () => {
+            multifloorToggle.checked = !multifloorToggle.checked;
+            multifloorToggle.dispatchEvent(new Event('change'));
         };
 
         saveBtn.onclick = async () => {
@@ -317,7 +316,8 @@ function displayTemplates(templates) {
                     body: JSON.stringify({
                         name: card.querySelector('.template-name-input').value,
                         color: card.querySelector('.color-select').value,
-                        stationary: card.querySelector('.template-stationary-toggle').checked
+
+                        multifloor: card.querySelector('.template-multifloor-toggle').checked
                     })
                 });
 

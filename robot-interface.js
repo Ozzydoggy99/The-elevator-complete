@@ -14,7 +14,7 @@ class MapManager {
     async refreshMaps() {
         try {
             const mapsList = await this.robot.getMaps();
-            this.maps.clear();
+            this.maps.clear(); 
             
             for (const mapData of mapsList) {
                 this.maps.set(mapData.id, {
