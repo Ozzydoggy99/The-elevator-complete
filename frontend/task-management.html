@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Task Management Interface</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="user-interface.css">
+</head>
+<body>
+    <div class="user-container">
+        <header class="user-header">
+            <div class="header-content">
+                <h1>Task Management System</h1>
+                <div class="user-info">
+                    <span id="clock" style="margin-right: 15px; font-weight: 500; color: #666;"></span>
+                    <span id="username">Username</span>
+                    <button id="logoutBtn" class="btn btn-danger">Logout</button>
+                </div>
+            </div>
+        </header>
+
+        <main class="user-content">
+            <!-- Task Selection Page -->
+            <div id="taskPage" class="workflow-page">
+                <div class="workflow-options">
+                    <div class="workflow-option" id="assignTaskOption">
+                        <h2>Assign Task</h2>
+                        <h2 style="margin-top: 5px; color: #666;">Asignar Tarea</h2>
+                    </div>
+                    <div class="workflow-option" id="scheduleTaskOption">
+                        <h2>Schedule Recurring Task</h2>
+                        <h2 style="margin-top: 5px; color: #666;">Programar Tarea Recurrente</h2>
+                    </div>
+                    <div class="workflow-option" id="taskQueueOption">
+                        <h2>Task Queue</h2>
+                        <h2 style="margin-top: 5px; color: #666;">Cola de Tareas</h2>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="task-management.js"></script>
+</body>
+</html> 

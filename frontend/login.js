@@ -30,6 +30,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
             if (data.user.role === 'admin') {
                 window.location.href = '/user-templates.html';
             } else if (data.user.role === 'boss') {
+                // Special handling for users with 'boss' role (like testerik and demo)
                 // Get the template ID for this boss user
                 const templateResponse = await fetch('/api/templates', {
                     headers: {
@@ -42,10 +43,12 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
                     // Use boss_user directly as stored in the database
                     const userTemplate = templates.find(t => t.boss_user && t.boss_user.username === username);
                     if (userTemplate) {
-                        window.location.href = `/user-interface.html?templateId=${userTemplate.id}`;
+                        window.location.href = `/task-management.html?templateId=${userTemplate.id}`;
                     } else {
-                        alert('No template found for this user');
+                        window.location.href = '/task-management.html';
                     }
+                } else {
+                    window.location.href = '/task-management.html';
                 }
             } else {
                 window.location.href = '/user-interface.html';

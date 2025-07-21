@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reschedule Recurring Task - Robot Control Interface</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="user-interface.css">
+</head>
+<body>
+    <div class="user-container">
+        <header class="user-header">
+            <div class="header-content">
+                <h1>Reschedule Recurring Task</h1>
+                <div class="user-info">
+                    <span id="clock" style="margin-right: 15px; font-weight: 500; color: #666;"></span>
+                    <span id="username">Username</span>
+                    <button id="logoutBtn" class="btn btn-danger">Logout</button>
+                </div>
+            </div>
+        </header>
+
+        <main class="user-content">
+            <div style="position: relative; width: 100%; max-width: 1200px; margin: 0 auto;">
+                <button id="backBtn" class="btn btn-secondary" style="position: absolute; top: 0; right: 0;">← Back</button>
+                
+                <!-- Time Selection Page -->
+                <div id="timeSelectionPage" class="time-selection-page">
+                    <h2 style="text-align: center; margin-bottom: 40px;">Select Time for Recurring Task</h2>
+                    
+                    <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                        <div style="background: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); padding: 20px;">
+                            <div style="margin-bottom: 20px;">
+                                <h3>Task Details:</h3>
+                                <div id="taskDetails" style="background: #f8f9fa; padding: 15px; border-radius: 6px; margin-top: 10px;">
+                                    <!-- Task details will be populated here -->
+                                </div>
+                            </div>
+                            
+                            <div style="margin-bottom: 20px;">
+                                <h3>Select Time:</h3>
+                                <div style="display: flex; gap: 15px; align-items: center; margin-top: 10px;">
+                                    <label for="timeInput" style="font-weight: bold;">Time:</label>
+                                    <input type="time" id="timeInput" style="padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px;">
+                                </div>
+                            </div>
+                            
+                            <div style="margin-bottom: 20px;">
+                                <h3>Days of the Week:</h3>
+                                <div style="margin-top: 10px;">
+                                    <div style="margin-bottom: 10px;">
+                                        <label style="display: flex; align-items: center; gap: 8px; font-weight: bold;">
+                                            <input type="checkbox" id="everydayCheckbox" style="transform: scale(1.2);">
+                                            Everyday
+                                        </label>
+                                    </div>
+                                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="mondayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Monday
+                                        </label>
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="tuesdayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Tuesday
+                                        </label>
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="wednesdayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Wednesday
+                                        </label>
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="thursdayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Thursday
+                                        </label>
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="fridayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Friday
+                                        </label>
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="saturdayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Saturday
+                                        </label>
+                                        <label style="display: flex; align-items: center; gap: 8px;">
+                                            <input type="checkbox" id="sundayCheckbox" class="day-checkbox" style="transform: scale(1.2);">
+                                            Sunday
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div style="text-align: center; margin-top: 30px;">
+                                <button id="confirmBtn" class="btn btn-primary" style="padding: 12px 24px; font-size: 16px;">
+                                    Schedule Recurring Task
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="reschedule-recurring-task.js"></script>
+</body>
+</html> 

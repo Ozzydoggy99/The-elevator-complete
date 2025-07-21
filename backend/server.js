@@ -5,6 +5,7 @@ const path = require('path');
 const WorkflowManager = require('./core/WorkflowManager');
 const RobotManager = require('./core/RobotManager');
 const MapManager = require('./core/MapManager');
+const RecurringTaskScheduler = require('./core/RecurringTaskScheduler');
 const RelayManager = require('./core/RelayManager');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -40,6 +41,7 @@ const workflowManager = new WorkflowManager();
 const robotManager = new RobotManager();
 const mapManager = new MapManager();
 const relayManager = new RelayManager();
+const recurringTaskScheduler = new RecurringTaskScheduler();
 
 // Initialize database tables
 async function initializeDatabase() {
@@ -1274,29 +1276,6 @@ async function sendJack(robot, service) {
 
     console.log('Jack Operation Response:', await response.json());
     await new Promise(resolve => setTimeout(resolve, 10000));
-}
-
-            
-            const response = await fetch(`${robotConfig.getBaseUrl()}/chassis/moves`, {
-                method: 'POST',
-                headers: robotConfig.getHeaders(),
-                body: JSON.stringify(forceMoveParams)
-            });
-            
-            if (response.ok) {
-                const data = await response.json();
-                console.log('✅ Force move command succeeded:', data);
-                return data.id || data.action_id || data.task_id;
-            } else {
-                console.log('❌ Force move command failed:', response.status, response.statusText);
-            }
-        } catch (error) {
-            console.log('❌ Error with force move command:', error.message);
-        }
-    }
-    
-    console.log('⚠️ No force/ignore endpoints worked');
-    return false;
 }
 
 async function checkMoveStatus(robot, moveId) {
@@ -4237,8 +4216,16 @@ app.get('/api/elevator/logs/:device_id', authenticateToken, async (req, res) => 
 
 // Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on port ${PORT}`);
+    
+    // Start the recurring task scheduler
+    try {
+        await recurringTaskScheduler.start();
+        console.log('Recurring task scheduler started successfully');
+    } catch (error) {
+        console.error('Failed to start recurring task scheduler:', error);
+    }
 }); 
 
 // Start relay server on port 40000 for elevator relays
@@ -4381,6 +4368,92 @@ async function programESP32Device(port, firmwareConfig, config) {
         }
     });
 }
+
+// API endpoint to create a recurring task
+app.post('/api/templates/:templateId/recurring-tasks', authenticateToken, async (req, res) => {
+    try {
+        const { templateId } = req.params;
+        const { type, floor, shelfPoint, schedule } = req.body;
+
+        // Validate required fields
+        if (!type || !floor || !shelfPoint || !schedule || !schedule.time || !schedule.days_of_week) {
+            return res.status(400).json({ error: 'Missing required fields: type, floor, shelfPoint, schedule.time, schedule.days_of_week' });
+        }
+
+        // Validate schedule format
+        if (!Array.isArray(schedule.days_of_week) || schedule.days_of_week.length === 0) {
+            return res.status(400).json({ error: 'days_of_week must be a non-empty array' });
+        }
+
+        // Validate time format (HH:MM)
+        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+        if (!timeRegex.test(schedule.time)) {
+            return res.status(400).json({ error: 'Invalid time format. Use HH:MM format' });
+        }
+
+        // Create the recurring task
+        const recurringTask = await recurringTaskScheduler.createRecurringTask(templateId, {
+            type,
+            floor,
+            shelfPoint,
+            schedule
+        });
+
+        res.status(201).json({
+            message: 'Recurring task created successfully',
+            recurringTask
+        });
+
+    } catch (error) {
+        console.error('Error creating recurring task:', error);
+        res.status(500).json({ error: 'Failed to create recurring task' });
+    }
+});
+
+// API endpoint to get recurring tasks for a template
+app.get('/api/templates/:templateId/recurring-tasks', authenticateToken, async (req, res) => {
+    try {
+        const { templateId } = req.params;
+        const recurringTasks = await recurringTaskScheduler.getRecurringTasks(templateId);
+        res.json(recurringTasks);
+    } catch (error) {
+        console.error('Error fetching recurring tasks:', error);
+        res.status(500).json({ error: 'Failed to fetch recurring tasks' });
+    }
+});
+
+// API endpoint to delete a recurring task
+app.delete('/api/templates/:templateId/recurring-tasks/:recurringTaskId', authenticateToken, async (req, res) => {
+    try {
+        const { templateId, recurringTaskId } = req.params;
+        console.log('DELETE recurring task request:', { templateId, recurringTaskId });
+        
+        // Check if the recurring task exists first
+        const checkResult = await db.query('SELECT * FROM recurring_tasks WHERE id = $1 AND template_id = $2', [recurringTaskId, templateId]);
+        if (checkResult.rows.length === 0) {
+            console.log('Recurring task not found:', { recurringTaskId, templateId });
+            return res.status(404).json({ error: 'Recurring task not found' });
+        }
+        
+        console.log('Found recurring task:', checkResult.rows[0]);
+        await recurringTaskScheduler.deleteRecurringTask(recurringTaskId);
+        res.json({ message: 'Recurring task deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting recurring task:', error);
+        res.status(500).json({ error: 'Failed to delete recurring task' });
+    }
+});
+
+// API endpoint to get scheduler status
+app.get('/api/recurring-tasks/status', authenticateToken, async (req, res) => {
+    try {
+        const status = await recurringTaskScheduler.getStatus();
+        res.json(status);
+    } catch (error) {
+        console.error('Error getting scheduler status:', error);
+        res.status(500).json({ error: 'Failed to get scheduler status' });
+    }
+});
 
 // API endpoint to get unassigned relays from connected_relays table that can be assigned to templates
 app.get('/api/connected-relays/assignable', authenticateToken, async (req, res) => {
